@@ -29,6 +29,22 @@ struct Opt {
         help = "every command instance will be given IP address from a cidr"
     )]
     cidr: ipnet::IpNet,
+    #[clap(help = "man tbf. if not provided no tbf will be added. 
+        if single value provided with multiple commands, each command will be run with that tbf.
+        otherwise the number of tbfs must match the number of commands.")]
+    tbf: Vec<String>,
+    #[clap(help = "man netem. if not provided no netem will be added. 
+        if single value provided with multiple commands, each command will be run with that netem.
+        otherwise the number of netems must match the number of commands.")]
+    netem: Vec<String>,
+    #[clap(help = "periodic signal to send to the command.")]
+    signal: Vec<String>,
+    #[clap(help = "periodically terminate the command, and restart it after a given delay.")]
+    terminate: Vec<String>,
+    #[clap(
+        help = "periodically stop the command. unlike terminate, the command with be stopped with SIGSTOP, and resumed later"
+    )]
+    stop: Vec<String>,
 }
 
 fn main() {
@@ -172,5 +188,59 @@ impl Shell for Veth {
             format!("ip -n {} link set veth1 up", self.namespace.name()),
             format!("ip link set {} up", self.bridged_pair()),
         ]
+    }
+}
+
+// man tbf
+#[derive(Debug, Clone)]
+struct Tbf {
+    namespace: Namespace,
+    options: String,
+    parent: Option<String>,
+}
+
+impl Shell for Tbf {
+    fn commands(&self) -> Vec<String> {
+        if let Some(parent) = &self.parent {
+            vec![format!(
+                "ip netns exec {} tc qdisc add dev veth1 parent {} handle 10: tbf {}",
+                self.namespace.name(),
+                parent,
+                self.options
+            )]
+        } else {
+            vec![format!(
+                "ip netns exec {} tc qdisc add dev veth1 root handle 1: tbf {}",
+                self.namespace.name(),
+                self.options
+            )]
+        }
+    }
+}
+// man netem
+// netem can't be used as a parent in qdisc hierarchy
+#[derive(Debug, Clone)]
+struct Netem {
+    namespace: Namespace,
+    options: String,
+    parent: Option<String>,
+}
+
+impl Shell for Netem {
+    fn commands(&self) -> Vec<String> {
+        if let Some(parent) = &self.parent {
+            vec![format!(
+                "ip netns exec {} tc qdisc add dev veth1 parent {} handle 10: netem {}",
+                self.namespace.name(),
+                parent,
+                self.options
+            )]
+        } else {
+            vec![format!(
+                "ip netns exec {} tc qdisc add dev veth1 root handle 1: netem {}",
+                self.namespace.name(),
+                self.options,
+            )]
+        }
     }
 }

@@ -1,10 +1,13 @@
-use clap::Parser;
-use std::fmt::format;
+use clap::{error::ErrorKind, CommandFactory, Parser};
 use std::net::IpAddr;
 use std::process::{Command, Stdio};
 use std::str::FromStr;
 
 #[derive(Debug, Parser)]
+#[command(
+    name = "playonce",
+    about = "run several commands in their network namespace, introducing network latency and shaping traffic."
+)]
 struct Opt {
     #[clap(long = "command", short = 'c', help = "command to execute")]
     commands: Vec<String>,
@@ -12,14 +15,20 @@ struct Opt {
         long = "count",
         short = 'n',
         help = "number of command instances to run. 
-    if not provided each command is run once. 
-    if single value provided with multiple commands, each command will be run that many times.
-    otherwise the number of counts must match the number of commands."
+if not provided each command is run once. 
+if single value provided with multiple commands, each command will be run that many times.
+otherwise the number of counts must match the number of commands."
     )]
     counts: Vec<usize>,
-    #[clap(help = "man tbf. it is passed as is to tc qdisc after tbf keyword.")]
+    #[clap(
+        long = "tbf",
+        help = "man tbf. it is passed as is to tc qdisc after tbf keyword."
+    )]
     tbf: Vec<String>,
-    #[clap(help = "man netem. it is passed as is to tc qdisc after netem keyword.")]
+    #[clap(
+        long = "netem",
+        help = "man netem. it is passed as is to tc qdisc after netem keyword."
+    )]
     netem: Vec<String>,
     #[clap(
         long = "env",
@@ -28,13 +37,16 @@ struct Opt {
     )]
     env: Vec<EnvValue>,
     #[clap(
+        long = "cidr",
         default_value = "10.0.0.0/24",
         help = "every command instance will be given IP address from a cidr. 
-        cidr is expected to have as many addresses as th sum of all commands instances"
+cidr is expected to have as many addresses as th sum of all commands instances"
     )]
     cidr: ipnet::IpNet,
 
     #[clap(
+        long = "prefix",
+        short = 'p',
         help = "prefix for playground environment. every `X` in the value will be replaced by random integer.",
         default_value = "p-XXX"
     )]
@@ -84,6 +96,14 @@ impl FromStr for EnvValue {
 
 fn main() {
     let opts = Opt::parse();
+    if opts.commands.is_empty() {
+        Opt::command()
+            .error(
+                ErrorKind::InvalidValue,
+                "requires atleast one command to run. use --command or -c to provide commands.",
+            )
+            .exit();
+    }
 
     let mut addr = opts.cidr.hosts();
     let name = opts.unique_name();

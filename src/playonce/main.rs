@@ -1,6 +1,8 @@
 use clap::Parser;
+use std::fmt::format;
 use std::net::IpAddr;
 use std::process::{Command, Stdio};
+use std::str::FromStr;
 
 #[derive(Debug, Parser)]
 struct Opt {
@@ -15,57 +17,87 @@ struct Opt {
     otherwise the number of counts must match the number of commands."
     )]
     counts: Vec<usize>,
+    #[clap(help = "man tbf. it is passed as is to tc qdisc after tbf keyword.")]
+    tbf: Vec<String>,
+    #[clap(help = "man netem. it is passed as is to tc qdisc after netem keyword.")]
+    netem: Vec<String>,
     #[clap(
         long = "env",
         short = 'e',
-        help = "environment variables to set for the command. 
-        if not provided the current environment is used.
-        if single value provided with multiple commands, each command will be run with that environment.
-        otherwise the number of envs must match the number of commands."
+        help = "environment variables to set for the command. KEY=VALUE"
     )]
-    env: Vec<String>,
+    env: Vec<EnvValue>,
     #[clap(
         default_value = "10.0.0.0/24",
-        help = "every command instance will be given IP address from a cidr"
+        help = "every command instance will be given IP address from a cidr. 
+        cidr is expected to have as many addresses as th sum of all commands instances"
     )]
     cidr: ipnet::IpNet,
-    #[clap(help = "man tbf. if not provided no tbf will be added. 
-        if single value provided with multiple commands, each command will be run with that tbf.
-        otherwise the number of tbfs must match the number of commands.")]
-    tbf: Vec<String>,
-    #[clap(help = "man netem. if not provided no netem will be added. 
-        if single value provided with multiple commands, each command will be run with that netem.
-        otherwise the number of netems must match the number of commands.")]
-    netem: Vec<String>,
-    #[clap(help = "periodic signal to send to the command.")]
-    signal: Vec<String>,
-    #[clap(help = "periodically terminate the command, and restart it after a given delay.")]
-    terminate: Vec<String>,
+
     #[clap(
-        help = "periodically stop the command. unlike terminate, the command with be stopped with SIGSTOP, and resumed later"
+        help = "prefix for playground environment. every `X` in the value will be replaced by random integer.",
+        default_value = "p-XXX"
     )]
-    stop: Vec<String>,
+    prefix: String,
+    // #[clap(help = "periodic signal to send to the command.")]
+    // signal: Vec<String>,
+    // #[clap(help = "periodically terminate the command, and restart it after a given delay.")]
+    // terminate: Vec<String>,
+    // #[clap(
+    //     help = "periodically stop the command. unlike terminate, the command with be stopped with SIGSTOP, and resumed later"
+    // )]
+    // stop: Vec<String>,
+}
+
+impl Opt {
+    fn unique_name(&self) -> String {
+        let mut name = String::new();
+        for c in self.prefix.chars() {
+            if c == 'X' {
+                let i = rand::random::<u8>() % 10;
+                name.push_str(&i.to_string());
+            } else {
+                name.push(c);
+            }
+        }
+        name
+    }
+}
+
+#[derive(Debug, Clone)]
+struct EnvValue(String, String);
+
+impl FromStr for EnvValue {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let mut splitted = s.splitn(2, '=');
+        let key = splitted
+            .next()
+            .map_or(Err("no key found".to_string()), Ok)?;
+        let value = splitted
+            .next()
+            .map_or(Err("no value found".to_string()), Ok)?;
+        Ok(EnvValue(key.to_string(), value.to_string()))
+    }
 }
 
 fn main() {
     let opts = Opt::parse();
+
     let mut addr = opts.cidr.hosts();
+    let name = opts.unique_name();
 
     let mut commands = vec![];
-    let ns = Namespace::new("ns2");
-    for cmd in ns.commands() {
-        commands.push(cmd);
-    }
-    let bridge = Bridge::new("play0");
-    for cmd in bridge.commands() {
-        commands.push(cmd);
-    }
+    let bridge = Bridge::new(name.as_str());
+    let ns = Namespace::new(name.as_str(), 0);
+
     let veth = Veth::new(addr.next().unwrap(), bridge.clone(), ns.clone());
     for cmd in veth.commands() {
         commands.push(cmd);
     }
     for cmd in commands.iter() {
-        println!("{}", cmd);
+        tracing::debug!("{}", cmd);
         let mut splitted = cmd.split_whitespace();
         let first = splitted.next().unwrap();
         let shell = Command::new(first)
@@ -86,29 +118,53 @@ trait Shell {
     fn commands(&self) -> Vec<String>;
 }
 
+struct ShellExecutor {
+    revert: Vec<String>,
+}
+
+impl ShellExecutor {
+    fn new() -> Self {
+        ShellExecutor { revert: vec![] }
+    }
+
+    fn execute(&mut self, cmd: &str, cleanup: Vec<&str>) -> anyhow::Result<()> {
+        self.revert.extend(cleanup.iter().map(|s| s.to_string()));
+        Ok(())
+    }
+}
+
+trait ShellExecutable {
+    fn execute(&self, executor: &mut ShellExecutor) -> anyhow::Result<()>;
+}
+
 #[derive(Debug, Clone)]
 struct Namespace {
-    name: String,
+    unique: String,
+    i: usize,
 }
 
 impl Namespace {
-    fn new(name: &str) -> Self {
+    fn new(unique: &str, i: usize) -> Self {
         Namespace {
-            name: name.to_string(),
+            unique: unique.to_string(),
+            i,
         }
     }
 
     fn name(&self) -> String {
-        self.name.clone()
+        format!("{}-{}", self.unique, self.i)
     }
 }
 
-impl Shell for Namespace {
-    fn commands(&self) -> Vec<String> {
-        vec![
-            format!("ip netns add {}", self.name),
-            format!("ip netns exec {} ip link set lo up", self.name),
-        ]
+impl ShellExecutable for Namespace {
+    fn execute(&self, executor: &mut ShellExecutor) -> anyhow::Result<()> {
+        let cleanup = format!("ip netns del {}", self.name());
+        executor.execute(&format!("ip netns add {}", self.name()), vec![&cleanup])?;
+        executor.execute(
+            &format!("ip netns exec {} ip link set lo up", self.name()),
+            vec![],
+        )?;
+        Ok(())
     }
 }
 
@@ -135,6 +191,16 @@ impl Shell for Bridge {
             format!("ip link add {} type bridge", self.link_name()),
             format!("ip link set {} up", self.link_name()),
         ]
+    }
+}
+
+struct BridgeCleanup {
+    bridge: Bridge,
+}
+
+impl Shell for BridgeCleanup {
+    fn commands(&self) -> Vec<String> {
+        vec![format!("ip link del {}", self.bridge.link_name())]
     }
 }
 
@@ -191,6 +257,22 @@ impl Shell for Veth {
     }
 }
 
+struct VethCleanup {
+    veth: Veth,
+}
+
+impl Shell for VethCleanup {
+    fn commands(&self) -> Vec<String> {
+        vec![
+            format!("ip link del {}", self.veth.bridged_pair()),
+            format!(
+                "ip netns exec {} ip link del veth1",
+                self.veth.namespace.name()
+            ),
+        ]
+    }
+}
+
 // man tbf
 #[derive(Debug, Clone)]
 struct Tbf {
@@ -243,4 +325,12 @@ impl Shell for Netem {
             )]
         }
     }
+}
+
+struct Instance {
+    command: String,
+    namespace: Namespace,
+    veth: Veth,
+    tbf: Option<Tbf>,
+    netem: Option<Netem>,
 }

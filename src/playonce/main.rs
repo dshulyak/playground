@@ -104,16 +104,60 @@ fn main() {
             )
             .exit();
     }
+    let mut executor = ShellExecutor::new();
+    if let Err(e) = run(&mut executor, &opts) {
+        tracing::error!("failed to run execution: {:?}", e);
+    }
+    if let Err(e) = executor.revert() {
+        tracing::error!("failed to revert execution: {:?}", e);
+    }
+}
 
+fn run(executor: &mut ShellExecutor, opts: &Opt) -> anyhow::Result<()> {
     let mut addr = opts.cidr.hosts();
     let name = opts.unique_name();
-
-    let mut executor = ShellExecutor::new();
-
     let bridge = Bridge::new(name.as_str());
+    bridge.execute(executor)?;
+    let mut runnables = vec![];
+    let first_tbf = opts.tbf.first().map(|s| s.clone());
+    let first_netem = opts.netem.first().map(|s| s.clone());
+    for (i, cmd) in opts.commands.iter().enumerate() {
+        let ns = Namespace::new(name.as_str(), i);
+        let veth = Veth::new(addr.next().unwrap(), bridge.clone(), ns.clone());
 
-    let ns = Namespace::new(name.as_str(), 0);
-    let veth = Veth::new(addr.next().unwrap(), bridge.clone(), ns.clone());
+        let tbf = opts
+            .tbf
+            .get(i)
+            .map(|s| s.clone())
+            .or(first_tbf.clone())
+            .map(|s| Tbf::new(ns.clone(), s, None));
+
+        let netem = opts
+            .netem
+            .get(i)
+            .map(|s| s.clone())
+            .or(first_netem.clone())
+            .map(|s| Netem::new(ns.clone(), s, tbf.as_ref().map(|t| t.handle())));
+
+        let instance = Instance::new(cmd.clone(), ns, veth, tbf, netem);
+        instance.execute(executor)?;
+        runnables.push(instance);
+    }
+    let mut childs = vec![];
+    for runnable in runnables.into_iter() {
+        let mut splitted = runnable.command.split_whitespace();
+        let first = splitted.next().unwrap();
+        let shell = Command::new(first)
+            .args(splitted)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?;
+        childs.push(shell);
+    }
+    for mut child in childs.into_iter() {
+        child.wait();
+    }
+    Ok(())
 }
 
 struct ShellExecutor {
@@ -313,6 +357,14 @@ impl Tbf {
             parent,
         }
     }
+
+    fn handle(&self) -> String {
+        if let Some(_) = self.parent {
+            String::from_str("handle 10:").expect("infallible")
+        } else {
+            String::from_str("handle 1:").expect("infallible")
+        }
+    }
 }
 
 impl ShellExecutable for Tbf {
@@ -387,7 +439,7 @@ impl ShellExecutable for Netem {
 }
 
 struct Instance {
-    command: String,
+    pub command: String,
     namespace: Namespace,
     veth: Veth,
     tbf: Option<Tbf>,

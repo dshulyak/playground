@@ -1,7 +1,10 @@
 use clap::{error::ErrorKind, CommandFactory, Parser};
+use std::io::{BufRead, BufReader};
 use std::net::IpAddr;
 use std::process::{Command, Stdio};
 use std::str::FromStr;
+use std::thread;
+use tracing::metadata::LevelFilter;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -104,7 +107,19 @@ fn main() {
             )
             .exit();
     }
+    tracing::subscriber::set_global_default(
+        tracing_subscriber::FmtSubscriber::builder()
+            .with_env_filter(
+                tracing_subscriber::EnvFilter::builder()
+                    .with_default_directive(LevelFilter::INFO.into())
+                    .from_env_lossy(),
+            )
+            .finish(),
+    )
+    .unwrap();
+
     let mut executor = ShellExecutor::new();
+
     if let Err(e) = run(&mut executor, &opts) {
         tracing::error!("failed to run execution: {:?}", e);
     }
@@ -130,7 +145,7 @@ fn run(executor: &mut ShellExecutor, opts: &Opt) -> anyhow::Result<()> {
             .get(i)
             .map(|s| s.clone())
             .or(first_tbf.clone())
-            .map(|s| Tbf::new(ns.clone(), s, None));
+            .map(|s| Tbf::new(veth.clone(), s, None));
 
         let netem = opts
             .netem
@@ -139,24 +154,52 @@ fn run(executor: &mut ShellExecutor, opts: &Opt) -> anyhow::Result<()> {
             .or(first_netem.clone())
             .map(|s| Netem::new(ns.clone(), s, tbf.as_ref().map(|t| t.handle())));
 
-        let instance = Instance::new(cmd.clone(), ns, veth, tbf, netem);
+        let instance = Instance::new(i, cmd.clone(), ns, veth, tbf, netem);
         instance.execute(executor)?;
         runnables.push(instance);
     }
-    let mut childs = vec![];
-    for runnable in runnables.into_iter() {
-        let mut splitted = runnable.command.split_whitespace();
-        let first = splitted.next().unwrap();
-        let shell = Command::new(first)
-            .args(splitted)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()?;
-        childs.push(shell);
-    }
-    for mut child in childs.into_iter() {
-        child.wait();
-    }
+    thread::scope(|s| {
+        for runnable in runnables.into_iter() {
+            let cmd = runnable.command();
+            let mut splitted = cmd.split_whitespace();
+            let first = splitted.next().unwrap();
+            let mut shell = Command::new(first)
+                .args(splitted)
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap();
+            let stdout = shell.stdout.take().unwrap();
+            let stderr = shell.stderr.take().unwrap();
+            s.spawn(move || {
+                let reader = BufReader::new(stdout);
+                for line in reader.lines() {
+                    match line {
+                        Ok(line) => {
+                            tracing::info!("[{}]: {}", runnable.i, line);
+                        }
+                        Err(e) => {
+                            tracing::debug!("[{}]: failed to read stdout: {:?}", runnable.i, e);
+                        }
+                    }
+                }
+            });
+            s.spawn(move || {
+                let reader = BufReader::new(stderr);
+                for line in reader.lines() {
+                    match line {
+                        Ok(line) => {
+                            tracing::info!("[{}]: {}", runnable.i, line);
+                        }
+                        Err(e) => {
+                            tracing::debug!("[{}]: failed to read stderr: {:?}", runnable.i, e);
+                        }
+                    }
+                }
+            });
+        }
+    });
+
     Ok(())
 }
 
@@ -170,6 +213,8 @@ impl ShellExecutor {
     }
 
     fn execute(&mut self, cmd: &str, cleanup: Vec<&str>) -> anyhow::Result<()> {
+        tracing::debug!("execute: {}", cmd);
+
         let mut splitted = cmd.split_whitespace();
         let first = splitted.next().unwrap();
         let shell = Command::new(first)
@@ -179,8 +224,7 @@ impl ShellExecutor {
             .spawn()?;
         let output = shell.wait_with_output()?;
         if !output.status.success() {
-            let err = String::from_utf8_lossy(&output.stderr);
-            return Err(anyhow::anyhow!("{}", err));
+            anyhow::bail!("failed to execute command: {}", cmd)
         } else {
             self.revert.extend(cleanup.iter().map(|s| s.to_string()));
             Ok(())
@@ -198,8 +242,7 @@ impl ShellExecutor {
                 .spawn()?;
             let output = shell.wait_with_output()?;
             if !output.status.success() {
-                let err = String::from_utf8_lossy(&output.stderr);
-                return Err(anyhow::anyhow!("{}", err));
+                anyhow::bail!("failed to revert command: {}", cmd)
             }
         }
         Ok(())
@@ -293,6 +336,10 @@ impl Veth {
         }
     }
 
+    fn namespace_pair(&self) -> String {
+        format!("veth-{}-ns", self.namespace.name())
+    }
+
     fn bridged_pair(&self) -> String {
         format!("veth-{}-br", self.namespace.name())
     }
@@ -300,20 +347,24 @@ impl Veth {
 
 impl ShellExecutable for Veth {
     fn execute(&self, executor: &mut ShellExecutor) -> anyhow::Result<()> {
-        let del_veth = format!("ip link del {}", "veth1");
+        let del_veth = format!("ip link del {}", self.namespace_pair());
         let del_bridge = format!("ip link del {}", self.bridged_pair());
         executor.execute(
             &format!(
                 "ip link add {} type veth peer name {}",
-                "veth1",
+                self.namespace_pair(),
                 self.bridged_pair()
             ),
             vec![&del_veth, &del_bridge],
         )?;
         // set default namespace for veth1
-        let set_default = format!("ip link set {} netns 1", "veth1");
+        let set_default = format!("ip link set {} netns 1", self.namespace_pair());
         executor.execute(
-            &format!("ip link set veth1 netns {}", self.namespace.name()),
+            &format!(
+                "ip link set {} netns {}",
+                self.namespace_pair(),
+                self.namespace.name()
+            ),
             vec![&set_default],
         )?;
         executor.execute(
@@ -326,14 +377,19 @@ impl ShellExecutable for Veth {
         )?;
         executor.execute(
             &format!(
-                "ip -n {} addr add {} dev veth1",
+                "ip -n {} addr add {} dev {}",
                 self.namespace.name(),
-                self.addr()
+                self.addr(),
+                self.namespace_pair(),
             ),
             vec![],
         )?;
         executor.execute(
-            &format!("ip -n {} link set veth1 up", self.namespace.name()),
+            &format!(
+                "ip -n {} link set {} up",
+                self.namespace.name(),
+                self.namespace_pair()
+            ),
             vec![],
         )?;
         executor.execute(&format!("ip link set {} up", self.bridged_pair()), vec![])?;
@@ -344,15 +400,15 @@ impl ShellExecutable for Veth {
 // man tbf
 #[derive(Debug, Clone)]
 struct Tbf {
-    namespace: Namespace,
+    veth: Veth,
     options: String,
     parent: Option<String>,
 }
 
 impl Tbf {
-    fn new(namespace: Namespace, options: String, parent: Option<String>) -> Self {
+    fn new(veth: Veth, options: String, parent: Option<String>) -> Self {
         Tbf {
-            namespace,
+            veth: veth,
             options: options,
             parent,
         }
@@ -372,8 +428,9 @@ impl ShellExecutable for Tbf {
         if let Some(parent) = &self.parent {
             executor.execute(
                 &format!(
-                    "ip netns exec {} tc qdisc add dev veth1 parent {} handle 10: tbf {}",
-                    self.namespace.name(),
+                    "ip netns exec {} tc qdisc add dev {} parent {} handle 10: tbf {}",
+                    self.veth.namespace_pair(),
+                    self.veth.namespace.name(),
                     parent,
                     self.options
                 ),
@@ -382,8 +439,9 @@ impl ShellExecutable for Tbf {
         } else {
             executor.execute(
                 &format!(
-                    "ip netns exec {} tc qdisc add dev veth1 root handle 1: tbf {}",
-                    self.namespace.name(),
+                    "ip netns exec {} tc qdisc add dev {} root handle 1: tbf {}",
+                    self.veth.namespace_pair(),
+                    self.veth.namespace.name(),
                     self.options
                 ),
                 vec![],
@@ -439,7 +497,8 @@ impl ShellExecutable for Netem {
 }
 
 struct Instance {
-    pub command: String,
+    i: usize,
+    command: String,
     namespace: Namespace,
     veth: Veth,
     tbf: Option<Tbf>,
@@ -448,6 +507,7 @@ struct Instance {
 
 impl Instance {
     fn new(
+        i: usize,
         command: String,
         namespace: Namespace,
         veth: Veth,
@@ -455,12 +515,17 @@ impl Instance {
         netem: Option<Netem>,
     ) -> Self {
         Instance {
+            i,
             command,
             namespace,
             veth,
             tbf,
             netem,
         }
+    }
+
+    fn command(&self) -> String {
+        format!("ip netns exec {} {}", self.namespace.name(), self.command)
     }
 }
 

@@ -63,6 +63,11 @@ cidr is expected to have as many addresses as th sum of all commands instances"
     //     help = "periodically stop the command. unlike terminate, the command with be stopped with SIGSTOP, and resumed later"
     // )]
     // stop: Vec<String>,
+    #[clap(
+        long = "no-revert",
+        help = "do not revert the changes made to the network configuration."
+    )]
+    no_revert: bool,
 }
 
 impl Opt {
@@ -133,14 +138,17 @@ fn main() {
     } else if let Err(e) = run(instances.unwrap(), tx) {
         tracing::error!("failed to run execution: {:?}", e);
     }
-    if let Err(e) = executor.revert() {
-        tracing::error!("failed to revert execution: {:?}", e);
+    if !opts.no_revert {
+        if let Err(e) = executor.revert() {
+            tracing::error!("failed to revert execution: {:?}", e);
+        }
     }
 }
 
 fn prepare(executor: &mut ShellExecutor, opts: &Opt) -> anyhow::Result<Vec<Instance>> {
     let mut addr = opts.cidr.hosts();
     let name = opts.unique_name();
+    tracing::info!("running playground {}", name);
     let bridge = Bridge::new(name.as_str());
     bridge.execute(executor)?;
     let mut instances = vec![];

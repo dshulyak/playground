@@ -3,6 +3,7 @@ use std::io::{BufRead, BufReader};
 use std::net::IpAddr;
 use std::process::{Command, Stdio};
 use std::str::FromStr;
+use std::sync::mpsc::Receiver;
 use std::thread;
 use tracing::metadata::LevelFilter;
 
@@ -118,9 +119,18 @@ fn main() {
     )
     .unwrap();
 
-    let mut executor = ShellExecutor::new();
+    let (rx, tx) = std::sync::mpsc::channel::<()>();
+    ctrlc::set_handler(move || {
+        tracing::info!("received interrupt. wait for program to cleanup");
+        rx.send(()).unwrap();
+    })
+    .expect("failed to set interrupt handler");
 
-    if let Err(e) = run(&mut executor, &opts) {
+    let mut executor = ShellExecutor::new();
+    let instances = prepare(&mut executor, &opts);
+    if let Err(e) = instances {
+        tracing::error!("failed to prepare instances: {:?}", e);
+    } else if let Err(e) = run(instances.unwrap(), tx) {
         tracing::error!("failed to run execution: {:?}", e);
     }
     if let Err(e) = executor.revert() {
@@ -128,12 +138,12 @@ fn main() {
     }
 }
 
-fn run(executor: &mut ShellExecutor, opts: &Opt) -> anyhow::Result<()> {
+fn prepare(executor: &mut ShellExecutor, opts: &Opt) -> anyhow::Result<Vec<Instance>> {
     let mut addr = opts.cidr.hosts();
     let name = opts.unique_name();
     let bridge = Bridge::new(name.as_str());
     bridge.execute(executor)?;
-    let mut runnables = vec![];
+    let mut instances = vec![];
     let first_tbf = opts.tbf.first().map(|s| s.clone());
     let first_netem = opts.netem.first().map(|s| s.clone());
     for (i, cmd) in opts.commands.iter().enumerate() {
@@ -156,10 +166,15 @@ fn run(executor: &mut ShellExecutor, opts: &Opt) -> anyhow::Result<()> {
 
         let instance = Instance::new(i, cmd.clone(), ns, veth, tbf, netem);
         instance.execute(executor)?;
-        runnables.push(instance);
+        instances.push(instance);
     }
+    Ok(instances)
+}
+
+fn run(instances: Vec<Instance>, rx: Receiver<()>) -> anyhow::Result<()> {
     thread::scope(|s| {
-        for runnable in runnables.into_iter() {
+        let mut childs = vec![];
+        for runnable in instances.into_iter() {
             let cmd = runnable.command();
             let mut splitted = cmd.split_whitespace();
             let first = splitted.next().unwrap();
@@ -171,6 +186,7 @@ fn run(executor: &mut ShellExecutor, opts: &Opt) -> anyhow::Result<()> {
                 .unwrap();
             let stdout = shell.stdout.take().unwrap();
             let stderr = shell.stderr.take().unwrap();
+            childs.push(shell);
             s.spawn(move || {
                 let reader = BufReader::new(stdout);
                 for line in reader.lines() {
@@ -198,6 +214,10 @@ fn run(executor: &mut ShellExecutor, opts: &Opt) -> anyhow::Result<()> {
                 }
             });
         }
+        rx.recv().expect("failed to receive interrupt");
+        for mut child in childs {
+            child.kill().expect("failed to kill child process");
+        }
     });
 
     Ok(())
@@ -224,7 +244,11 @@ impl ShellExecutor {
             .spawn()?;
         let output = shell.wait_with_output()?;
         if !output.status.success() {
-            anyhow::bail!("failed to execute command: {}", cmd)
+            anyhow::bail!(
+                "execute: {}. stderr: {:?}",
+                cmd,
+                String::from_utf8(output.stderr)
+            )
         } else {
             self.revert.extend(cleanup.iter().map(|s| s.to_string()));
             Ok(())
@@ -242,7 +266,11 @@ impl ShellExecutor {
                 .spawn()?;
             let output = shell.wait_with_output()?;
             if !output.status.success() {
-                anyhow::bail!("failed to revert command: {}", cmd)
+                anyhow::bail!(
+                    "execute: {}. stderr: {:?}",
+                    cmd,
+                    String::from_utf8(output.stderr)
+                )
             }
         }
         Ok(())
@@ -347,7 +375,6 @@ impl Veth {
 
 impl ShellExecutable for Veth {
     fn execute(&self, executor: &mut ShellExecutor) -> anyhow::Result<()> {
-        let del_veth = format!("ip link del {}", self.namespace_pair());
         let del_bridge = format!("ip link del {}", self.bridged_pair());
         executor.execute(
             &format!(
@@ -355,10 +382,14 @@ impl ShellExecutable for Veth {
                 self.namespace_pair(),
                 self.bridged_pair()
             ),
-            vec![&del_veth, &del_bridge],
+            vec![&del_bridge],
         )?;
         // set default namespace for veth1
-        let set_default = format!("ip link set {} netns 1", self.namespace_pair());
+        let set_default = format!(
+            "ip -n {} link set {} netns 1",
+            self.namespace.name(),
+            self.namespace_pair()
+        );
         executor.execute(
             &format!(
                 "ip link set {} netns {}",

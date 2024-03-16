@@ -105,15 +105,16 @@ impl FromStr for EnvValue {
 
 fn main() {
     let opts = Opt::parse();
+    let mut cmd = Opt::command();
     if opts.commands.is_empty() {
-        Opt::command()
-            .error(
-                ErrorKind::InvalidValue,
-                "requires atleast one command to run. use --command or -c to provide commands.",
-            )
-            .exit();
+        cmd.error(
+            ErrorKind::InvalidValue,
+            "requires atleast one command to run. use --command or -c to provide commands.",
+        )
+        .exit();
     }
-    tracing::subscriber::set_global_default(
+
+    if let Err(e) = tracing::subscriber::set_global_default(
         tracing_subscriber::FmtSubscriber::builder()
             .with_env_filter(
                 tracing_subscriber::EnvFilter::builder()
@@ -121,22 +122,33 @@ fn main() {
                     .from_env_lossy(),
             )
             .finish(),
-    )
-    .unwrap();
+    ) {
+        cmd.error(
+            ErrorKind::Io,
+            format!("failed to set global default subscriber: {:?}", e),
+        )
+        .exit();
+    }
 
     let (rx, tx) = std::sync::mpsc::channel::<()>();
-    ctrlc::set_handler(move || {
+    if let Err(e) = ctrlc::set_handler(move || {
         tracing::info!("received interrupt. wait for program to cleanup");
-        rx.send(()).unwrap();
-    })
-    .expect("failed to set interrupt handler");
+        _ = rx.send(());
+    }) {
+        cmd.error(
+            ErrorKind::Io,
+            format!("failed to set interrupt handler: {:?}", e),
+        )
+        .exit();
+    }
 
     let mut executor = ShellExecutor::new();
     let instances = prepare(&mut executor, &opts);
+
     if let Err(e) = instances {
-        tracing::error!("failed to prepare instances: {:?}", e);
+        tracing::error!("prepare commands: {:?}", e);
     } else if let Err(e) = run(instances.unwrap(), tx) {
-        tracing::error!("failed to run execution: {:?}", e);
+        tracing::error!("run commands: {:?}", e);
     }
     if !opts.no_revert {
         if let Err(e) = executor.revert() {
@@ -156,7 +168,7 @@ fn prepare(executor: &mut ShellExecutor, opts: &Opt) -> anyhow::Result<Vec<Insta
     let first_netem = opts.netem.first().map(|s| s.clone());
     for (i, cmd) in opts.commands.iter().enumerate() {
         let ns = Namespace::new(name.as_str(), i);
-        let veth = Veth::new(addr.next().unwrap(), bridge.clone(), ns.clone());
+        let veth: Veth = Veth::new(addr.next().unwrap(), bridge.clone(), ns.clone());
 
         let tbf = opts
             .tbf
@@ -170,7 +182,7 @@ fn prepare(executor: &mut ShellExecutor, opts: &Opt) -> anyhow::Result<Vec<Insta
             .get(i)
             .map(|s| s.clone())
             .or(first_netem.clone())
-            .map(|s| Netem::new(ns.clone(), s, tbf.as_ref().map(|t| t.handle())));
+            .map(|s| Netem::new(veth.clone(), s, tbf.as_ref().map(|t| t.handle())));
 
         let instance = Instance::new(i, cmd.clone(), ns, veth, tbf, netem);
         instance.execute(executor)?;
@@ -203,7 +215,7 @@ fn run(instances: Vec<Instance>, rx: Receiver<()>) -> anyhow::Result<()> {
                             tracing::info!("[{}]: {}", runnable.i, line);
                         }
                         Err(e) => {
-                            tracing::debug!("[{}]: failed to read stdout: {:?}", runnable.i, e);
+                            tracing::debug!("[{}]: stdout: {:?}", runnable.i, e);
                         }
                     }
                 }
@@ -216,13 +228,13 @@ fn run(instances: Vec<Instance>, rx: Receiver<()>) -> anyhow::Result<()> {
                             tracing::info!("[{}]: {}", runnable.i, line);
                         }
                         Err(e) => {
-                            tracing::debug!("[{}]: failed to read stderr: {:?}", runnable.i, e);
+                            tracing::debug!("[{}]: stderr: {:?}", runnable.i, e);
                         }
                     }
                 }
             });
         }
-        rx.recv().expect("failed to receive interrupt");
+        _ = rx.recv();
         for mut child in childs {
             child.kill().expect("failed to kill child process");
         }
@@ -447,8 +459,8 @@ struct Tbf {
 impl Tbf {
     fn new(veth: Veth, options: String, parent: Option<String>) -> Self {
         Tbf {
-            veth: veth,
-            options: options,
+            veth,
+            options,
             parent,
         }
     }
@@ -494,16 +506,16 @@ impl ShellExecutable for Tbf {
 // netem can't be used as a parent in qdisc hierarchy
 #[derive(Debug, Clone)]
 struct Netem {
-    namespace: Namespace,
+    veth: Veth,
     options: String,
     parent: Option<String>,
 }
 
 impl Netem {
-    fn new(namespace: Namespace, options: String, parent: Option<String>) -> Self {
+    fn new(veth: Veth, options: String, parent: Option<String>) -> Self {
         Netem {
-            namespace,
-            options: options,
+            veth,
+            options,
             parent,
         }
     }
@@ -514,8 +526,9 @@ impl ShellExecutable for Netem {
         if let Some(parent) = &self.parent {
             executor.execute(
                 &format!(
-                    "ip netns exec {} tc qdisc add dev veth1 parent {} handle 10: netem {}",
-                    self.namespace.name(),
+                    "ip netns exec {} tc qdisc add dev {} parent {} handle 10: netem {}",
+                    self.veth.namespace.name(),
+                    self.veth.namespace_pair(),
                     parent,
                     self.options
                 ),
@@ -524,8 +537,9 @@ impl ShellExecutable for Netem {
         } else {
             executor.execute(
                 &format!(
-                    "ip netns exec {} tc qdisc add dev veth1 root handle 1: netem {}",
-                    self.namespace.name(),
+                    "ip netns exec {} tc qdisc add dev {} root handle 1: netem {}",
+                    self.veth.namespace.name(),
+                    self.veth.namespace_pair(),
                     self.options
                 ),
                 vec![],

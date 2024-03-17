@@ -1,3 +1,4 @@
+use anyhow::Context;
 use clap::{error::ErrorKind, CommandFactory, Parser};
 use std::io::{BufRead, BufReader};
 use std::net::IpAddr;
@@ -143,17 +144,21 @@ fn main() {
     }
 
     let mut executor = ShellExecutor::new();
-    let instances = prepare(&mut executor, &opts);
-
-    if let Err(e) = instances {
-        tracing::error!("prepare commands: {:?}", e);
-    } else if let Err(e) = run(instances.unwrap(), tx) {
-        tracing::error!("run commands: {:?}", e);
-    }
+    let mut err = match prepare(&mut executor, &opts) {
+        Ok(instances) => run(instances, tx).context("run commands"),
+        Err(e) => Err(e.context("prepare commands")),
+    };
     if !opts.no_revert {
         if let Err(e) = executor.revert() {
-            tracing::error!("failed to revert execution: {:?}", e);
+            if err.is_ok() {
+                err = Err(e.context("revert configuration"));
+            } else {
+                tracing::error!("revert execution: {:?}", e);
+            }
         }
+    }
+    if let Err(err) = err {
+        cmd.error(ErrorKind::Io, format!("{:?}", err)).exit();
     }
 }
 
@@ -384,23 +389,23 @@ impl Veth {
         }
     }
 
-    fn namespace_pair(&self) -> String {
+    fn ns_side(&self) -> String {
         format!("veth-{}-ns", self.namespace.name())
     }
 
-    fn bridged_pair(&self) -> String {
+    fn bridge_side(&self) -> String {
         format!("veth-{}-br", self.namespace.name())
     }
 }
 
 impl ShellExecutable for Veth {
     fn execute(&self, executor: &mut ShellExecutor) -> anyhow::Result<()> {
-        let del_bridge = format!("ip link del {}", self.bridged_pair());
+        let del_bridge = format!("ip link del {}", self.bridge_side());
         executor.execute(
             &format!(
                 "ip link add {} type veth peer name {}",
-                self.namespace_pair(),
-                self.bridged_pair()
+                self.ns_side(),
+                self.bridge_side()
             ),
             vec![&del_bridge],
         )?;
@@ -408,12 +413,12 @@ impl ShellExecutable for Veth {
         let set_default = format!(
             "ip -n {} link set {} netns 1",
             self.namespace.name(),
-            self.namespace_pair()
+            self.ns_side()
         );
         executor.execute(
             &format!(
                 "ip link set {} netns {}",
-                self.namespace_pair(),
+                self.ns_side(),
                 self.namespace.name()
             ),
             vec![&set_default],
@@ -421,7 +426,7 @@ impl ShellExecutable for Veth {
         executor.execute(
             &format!(
                 "ip link set {} master {}",
-                self.bridged_pair(),
+                self.bridge_side(),
                 self.bridge.link_name()
             ),
             vec![],
@@ -431,7 +436,7 @@ impl ShellExecutable for Veth {
                 "ip -n {} addr add {} dev {}",
                 self.namespace.name(),
                 self.addr(),
-                self.namespace_pair(),
+                self.ns_side(),
             ),
             vec![],
         )?;
@@ -439,11 +444,11 @@ impl ShellExecutable for Veth {
             &format!(
                 "ip -n {} link set {} up",
                 self.namespace.name(),
-                self.namespace_pair()
+                self.ns_side()
             ),
             vec![],
         )?;
-        executor.execute(&format!("ip link set {} up", self.bridged_pair()), vec![])?;
+        executor.execute(&format!("ip link set {} up", self.bridge_side()), vec![])?;
         Ok(())
     }
 }
@@ -480,7 +485,7 @@ impl ShellExecutable for Tbf {
             executor.execute(
                 &format!(
                     "ip netns exec {} tc qdisc add dev {} parent {} handle 10: tbf {}",
-                    self.veth.namespace_pair(),
+                    self.veth.ns_side(),
                     self.veth.namespace.name(),
                     parent,
                     self.options
@@ -491,7 +496,7 @@ impl ShellExecutable for Tbf {
             executor.execute(
                 &format!(
                     "ip netns exec {} tc qdisc add dev {} root handle 1: tbf {}",
-                    self.veth.namespace_pair(),
+                    self.veth.ns_side(),
                     self.veth.namespace.name(),
                     self.options
                 ),
@@ -528,7 +533,7 @@ impl ShellExecutable for Netem {
                 &format!(
                     "ip netns exec {} tc qdisc add dev {} parent {} handle 10: netem {}",
                     self.veth.namespace.name(),
-                    self.veth.namespace_pair(),
+                    self.veth.ns_side(),
                     parent,
                     self.options
                 ),
@@ -539,7 +544,7 @@ impl ShellExecutable for Netem {
                 &format!(
                     "ip netns exec {} tc qdisc add dev {} root handle 1: netem {}",
                     self.veth.namespace.name(),
-                    self.veth.namespace_pair(),
+                    self.veth.ns_side(),
                     self.options
                 ),
                 vec![],

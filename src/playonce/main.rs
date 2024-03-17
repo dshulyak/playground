@@ -202,15 +202,25 @@ fn run(instances: Vec<Instance>, rx: Receiver<()>) -> anyhow::Result<()> {
         for runnable in instances.into_iter() {
             let cmd = runnable.command();
             let mut splitted = cmd.split_whitespace();
-            let first = splitted.next().unwrap();
+            let first = splitted.next().ok_or_else(|| {
+                anyhow::anyhow!("no command found in the command string: {}", cmd)
+            })?;
             let mut shell = Command::new(first)
                 .args(splitted)
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
                 .spawn()
-                .unwrap();
-            let stdout = shell.stdout.take().unwrap();
-            let stderr = shell.stderr.take().unwrap();
+                .context("failed to spawn command")?;
+            let stdout = shell
+                .stdout
+                .take()
+                .ok_or_else(|| anyhow::anyhow!("failed to take stdout from child process"))?;
+
+            let stderr = shell
+                .stderr
+                .take()
+                .ok_or_else(|| anyhow::anyhow!("failed to take stderr from child process"))?;
+
             childs.push(shell);
             s.spawn(move || {
                 let reader = BufReader::new(stdout);
@@ -241,11 +251,12 @@ fn run(instances: Vec<Instance>, rx: Receiver<()>) -> anyhow::Result<()> {
         }
         _ = rx.recv();
         for mut child in childs {
-            child.kill().expect("failed to kill child process");
+            if let Err(e) = child.kill() {
+                tracing::error!("kill child process: {:?}", e);
+            }
         }
-    });
-
-    Ok(())
+        anyhow::Result::<()>::Ok(())
+    })
 }
 
 struct ShellExecutor {

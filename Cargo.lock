@@ -260,12 +260,23 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8afb450f006bf6385ca15ef45d71d2288452bc3683ce2e2cacc0d18e4be60b58"
 
 [[package]]
-name = "playground"
+name = "play"
 version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
  "ctrlc",
+ "ipnet",
+ "rand",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "playground"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
  "ipnet",
  "rand",
  "tracing",

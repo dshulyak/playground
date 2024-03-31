@@ -3,21 +3,15 @@ name = "playground"
 version = "0.1.0"
 edition = "2021"
 
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+[workspace]
+members = ["play"]
+resolver = "2"
 
 [dependencies]
 anyhow = "1.0.80"
-clap = { version = "4.5.1", features = ["derive"] }
-ctrlc = "3.4.4"
 ipnet = "2.9.0"
 rand = "0.8.5"
 tracing = "0.1.40"
+
+[dev-dependencies]
 tracing-subscriber = { version = "0.3.18", default-features = false, features = ["env-filter", "fmt", "ansi", "time", "local-time"] }
-
-
-[profile.release]
-opt-level = 3
-
-[[bin]]
-name = "playonce"
-path = "src/playonce/main.rs"

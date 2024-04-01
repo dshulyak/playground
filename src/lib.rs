@@ -1,20 +1,20 @@
 use std::collections::HashMap;
+use std::io::{BufReader, BufRead};
 use std::net::IpAddr;
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::str::FromStr;
 use std::thread;
 
+use anyhow::{Result, Context};
+use crossbeam::channel::{unbounded, Receiver, Sender};
+use ipnet::{IpAddrRange, IpNet};
 use rand::distributions::Alphanumeric;
 use rand::{thread_rng, Rng};
-use anyhow::Result;
-use ipnet::{IpAddrRange, IpNet};
-
 
 trait Actionable {
     fn apply(&self) -> Result<()>;
     fn revert(&self) -> Result<()>;
 }
-
 
 struct Env {
     prefix: String,
@@ -24,12 +24,14 @@ struct Env {
     namespaces: HashMap<String, Namespace>,
     veth: HashMap<String, Veth>,
     qdisc: HashMap<String, Qdisc>,
+    commands: HashMap<String, Task>,
+    errors_sender:  Option<Sender<anyhow::Result<()>>>,
+    errors_receiver: Receiver<anyhow::Result<()>>,
 }
-
-
 
 impl Env {
     pub fn new() -> Self {
+        let (errors_sender, errors_receiver) = unbounded();
         Env {
             prefix: format!("p-{}", random_suffix(4)),
             hosts: IpNet::from_str("10.0.0.0/16").unwrap().hosts(),
@@ -38,15 +40,18 @@ impl Env {
             namespaces: HashMap::new(),
             veth: HashMap::new(),
             qdisc: HashMap::new(),
+            commands: HashMap::new(),
+            errors_sender: Some(errors_sender),
+            errors_receiver,
         }
-    } 
+    }
 
-    pub fn inst(&mut self) -> Result<()> {
-        let id = self.next;
-        let ip = self.hosts.peekable().peek().map(|ip| *ip).unwrap();
-        let ns = Namespace::new(&self.prefix, id);
-        let veth = Veth::new(ip, self.bridge.as_ref().unwrap().clone(), ns.clone());
-        Ok(())
+    pub fn add(&mut self, cmd: String) -> Builder {
+        Builder::new(self, cmd)
+    }
+
+    pub fn errors(&self) -> &Receiver<anyhow::Result<()>> {
+        &self.errors_receiver
     }
 
     pub fn run(mut self, f: impl FnOnce(&mut Self)) -> Result<()> {
@@ -60,22 +65,85 @@ impl Env {
             f(&mut self);
             Ok(())
         };
-        for veth in self.veth.values() {
+        for (_, mut task) in self.commands.drain() {
+            if let Err(err) = task.stop() {
+                tracing::debug!("failed to stop task: {:?}", err);
+            }
+        }
+        for (_, veth) in self.veth.drain() {
             if let Err(err) = veth.revert() {
                 tracing::debug!("failed to revert veth: {:?}", err);
             };
         }
-        for namespace in self.namespaces.values() {
+        for (_, namespace) in self.namespaces.drain() {
             if let Err(err) = namespace.revert() {
                 tracing::debug!("failed to revert namespace: {:?}", err);
             };
         }
-        if let Some(bridge) = self.bridge {
+        if let Some(bridge) = self.bridge.take() {
             if let Err(err) = bridge.revert() {
                 tracing::debug!("failed to revert bridge: {:?}", err);
             };
         }
         rst
+    }
+}
+
+struct Builder<'a> {
+    env: &'a mut Env,
+    ip: IpAddr,
+    id: usize,
+    ns: Namespace,
+    veth: Veth,
+    qdisc: Option<Qdisc>,
+    command: String,
+}
+
+impl<'a> Builder<'a> {
+    fn new(env: &'a mut Env, cmd: String) -> Self {
+        let id = env.next;
+        let ip = env.hosts.peekable().peek().map(|ip| *ip).unwrap();
+        let ns = Namespace::new(&env.prefix, id);
+        let veth = Veth::new(ip, env.bridge.as_ref().unwrap().clone(), ns.clone());
+        Builder {
+            env,
+            ip,
+            id,
+            ns,
+            veth,
+            qdisc: None,
+            command: cmd,
+        }
+    }
+
+    pub fn with_qdisc(mut self, tbf: Option<String>, netem: Option<String>) -> Self {
+        if tbf.is_none() && netem.is_none() {
+            return self;
+        }
+        self.qdisc = Some(Qdisc::new(self.veth.clone(), tbf, netem));
+        self
+    }
+
+    pub fn spawn(self) -> anyhow::Result<()> {
+        let sender = match &self.env.errors_sender {
+            Some(sender) => sender.clone(),
+            None => anyhow::bail!("can't spawn new tasks after the environment has been run"),
+        }; 
+        _ = self.env.hosts.next();
+        self.env.next += 1;
+        let id = self.ns.name.clone();
+        self.env.namespaces.insert(id.clone(), self.ns.clone());
+        self.ns.apply()?;
+        self.env.veth.insert(id.clone(), self.veth.clone());
+        self.veth.apply()?;
+        if let Some(qdisc) = self.qdisc {
+            self.env.qdisc.insert(id.clone(), qdisc.clone());
+            qdisc.apply()?;
+        }
+        let mut task = Task::new(self.ns.clone(), self.command);
+        task.spawn(sender)?;
+        self.env.commands.insert(id.clone(), task);
+        Ok(())
     }
 }
 
@@ -270,5 +338,105 @@ fn random_suffix(n: usize) -> String {
     thread_rng()
         .sample_iter(&Alphanumeric)
         .take(n)
-        .map(char::from).collect()
+        .map(char::from)
+        .collect()
+}
+
+struct Task {
+    ns: Namespace,
+    cmd: String,
+    handlers: Vec<thread::JoinHandle<()>>,
+    process: Option<Child>,
+}
+
+impl Task {
+    fn new(ns: Namespace, cmd: String) -> Self {
+        Task {
+            ns,
+            cmd,
+            handlers: vec![],
+            process: None,
+        }
+    }
+
+    fn command(&self) -> String {
+        format!("ip netns exec {} {}", self.ns.name, self.cmd)
+    }
+
+    fn spawn(&mut self, errors_sender: Sender<Result<()>>) -> Result<()> {
+        let cmd = self.command();
+        let mut splitted = cmd.split_whitespace();
+        let first = splitted
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("no command found in the command string: {}", cmd))?;
+        let mut shell = Command::new(first)
+            .args(splitted)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .context("failed to spawn command")?;
+        let stdout = shell
+            .stdout
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("failed to take stdout from child process"))?;
+
+        let stderr = shell
+            .stderr
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("failed to take stderr from child process"))?;
+
+        let id = self.ns.name.clone();
+        let sender = errors_sender.clone();
+        let stdout_handler = thread::spawn(move || {
+            let reader = BufReader::new(stdout);
+            for line in reader.lines() {
+                match line {
+                    Ok(line) => {
+                        tracing::info!("[{}]: {}", id, line);
+                    }
+                    Err(e) => {
+                        let _ = sender.send(Err(e.into()));
+                        return;
+                    }
+                }
+            }
+        });
+        let id = self.ns.name.clone();
+        let sender= errors_sender.clone();
+        let stderr_handler = thread::spawn(move || {
+            let reader = BufReader::new(stderr);
+            for line in reader.lines() {
+                match line {
+                    Ok(line) => {
+                        tracing::info!("[{}]: {}", id, line);
+                    }
+                    Err(e) => {
+                        let _ = sender.send(Err(e.into()));
+                        return;
+                    }
+                }
+            }
+        });
+        self.process = Some(shell);
+        self.handlers.push(stdout_handler);
+        self.handlers.push(stderr_handler);
+        Ok(())
+    }
+
+    fn stop(&mut self) -> Result<()> {
+        if let Some(process) = &mut self.process {
+            process.kill()?;
+            match process.wait() {
+                Ok(status) => {
+                    if !status.success() {
+                        anyhow::bail!("command failed with status: {}", status);
+                    }
+                }
+                Err(err) => {
+                    anyhow::bail!("failed to wait for command: {:?}", err);
+                }
+            }
+        }
+        Ok(())
+    }
 }

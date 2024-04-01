@@ -223,8 +223,7 @@ fn run(instances: Vec<Instance>, rx: Receiver<()>) -> anyhow::Result<()> {
 
             childs.push(shell);
             s.spawn(move || {
-                let reader = BufReader::new(stdout);
-                for line in reader.lines() {
+                for line in BufReader::new(stdout).lines() {
                     match line {
                         Ok(line) => {
                             tracing::info!("[{}]: {}", runnable.i, line);
@@ -236,8 +235,7 @@ fn run(instances: Vec<Instance>, rx: Receiver<()>) -> anyhow::Result<()> {
                 }
             });
             s.spawn(move || {
-                let reader = BufReader::new(stderr);
-                for line in reader.lines() {
+                for line in BufReader::new(stderr).lines() {
                     match line {
                         Ok(line) => {
                             tracing::info!("[{}]: {}", runnable.i, line);

@@ -70,6 +70,12 @@ cidr is expected to have as many addresses as th sum of all commands instances"
         help = "do not revert the changes made to the network configuration."
     )]
     no_revert: bool,
+    #[clap(
+        short = 'w',
+        long = "work-dir",
+        help = "working directory for the command."
+    )]
+    work_dirs: Vec<String>,
 }
 
 impl Opt {
@@ -153,6 +159,7 @@ fn main() {
             let first_tbf = opts.tbf.first().map(|t| t.clone());
             let first_netem = opts.netem.first().map(|n| n.clone());
             let first_count = opts.counts.first().copied().unwrap_or(1);
+            let first_work_dir = opts.work_dirs.first().map(|w| w.clone());
             for (i, cmd) in opts.commands.iter().enumerate() {
                 for _ in 0..opts.counts.get(i).copied().unwrap_or(first_count) {
                     let tbf = opts
@@ -163,7 +170,14 @@ fn main() {
                         .netem
                         .get(i)
                         .map_or(first_netem.clone(), |n| Some(n.clone()));
-                    if let Err(err) = e.add(cmd.clone()).with_qdisc(tbf, netem).spawn() {
+                    let mut builder = e.add(cmd.clone()).with_qdisc(tbf, netem);
+                    if let Some(work_dir) = opts.work_dirs.get(i).or(first_work_dir.as_ref()) {
+                        builder = builder.with_work_dir(work_dir.clone());
+                    }
+                    for env in &opts.env {
+                        builder = builder.with_os_env(env.0.clone(), env.1.clone());
+                    } 
+                    if let Err(err) = builder.spawn() {
                         tracing::error!("failed to run command: {:?}", err);
                         return;
                     };

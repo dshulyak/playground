@@ -13,7 +13,6 @@ cargo build --manifest-path=./play/Cargo.toml
     duration is counted since last event timestamp. for example 30 minutes are counted since process was started or restarted.
     pause is counted since process was stopped.
     each of this commands accept jitter as second parameter.
-- [ ] add workdir and env for process
 - [ ] write logs from commands to selected locations instead of stdout
 - [ ] partition commands from each other periodically
 - [ ] slow/faulty disk emulation 

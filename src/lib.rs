@@ -115,6 +115,8 @@ pub struct Builder<'a> {
     veth: Veth,
     qdisc: Option<Qdisc>,
     command: String,
+    work_dir: Option<String>,
+    os_env: HashMap<String, String>,
 }
 
 impl<'a> Builder<'a> {
@@ -130,6 +132,8 @@ impl<'a> Builder<'a> {
             veth,
             qdisc: None,
             command: cmd,
+            work_dir: None,
+            os_env: HashMap::new(),
         }
     }
 
@@ -138,6 +142,16 @@ impl<'a> Builder<'a> {
             return self;
         }
         self.qdisc = Some(Qdisc::new(self.veth.clone(), tbf, netem));
+        self
+    }
+
+    pub fn with_work_dir(mut self, work_dir: String) -> Self {
+        self.work_dir = Some(work_dir);
+        self
+    }
+
+    pub fn with_os_env(mut self, key: String, value: String) -> Self {
+        self.os_env.insert(key, value);
         self
     }
 
@@ -158,7 +172,7 @@ impl<'a> Builder<'a> {
             qdisc.apply()?;
         }
         let mut task = Task::new(self.index, self.ns.clone(), self.command);
-        task.spawn(sender)?;
+        task.spawn(sender, self.work_dir.as_ref(), &self.os_env)?;
         self.env.commands.insert(id.clone(), task);
         Ok(())
     }
@@ -384,18 +398,28 @@ impl Task {
         format!("ip netns exec {} {}", self.ns.name, replaced)
     }
 
-    fn spawn(&mut self, errors_sender: Sender<Result<()>>) -> Result<()> {
+    fn spawn(&mut self, errors_sender: Sender<Result<()>>, work_dir: Option<&String>, env: &HashMap<String, String>) -> Result<()> {
         let cmd = self.command();
         let mut splitted = cmd.split_whitespace();
         let first = splitted
             .next()
             .ok_or_else(|| anyhow::anyhow!("no command found in the command string: {}", cmd))?;
-        let mut shell = Command::new(first)
-            .args(splitted)
+        
+        let mut shell = Command::new(first);
+        shell.args(splitted)
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
+            .stderr(Stdio::piped());
+        if let Some(work_dir) = work_dir {
+            shell.current_dir(work_dir);
+        }
+        for (key, value) in env {
+            shell.env(key, value);
+        }
+
+        let mut shell = shell
             .spawn()
             .context("failed to spawn command")?;
+
         let stdout = shell
             .stdout
             .take()

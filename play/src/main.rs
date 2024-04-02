@@ -1,18 +1,32 @@
 use anyhow::Result;
-use clap::{error::ErrorKind, CommandFactory, Parser};
+use clap::{error::ErrorKind, Command, CommandFactory, Parser, Subcommand};
 use crossbeam::{channel::unbounded, select};
 use playground::Env;
 use std::str::FromStr;
 use tracing::metadata::LevelFilter;
 
 #[derive(Debug, Parser)]
-#[command(
-    name = "playonce",
-    about = "run several commands in their network namespace, introducing network latency and shaping traffic."
-)]
-struct Opt {
-    #[clap(long = "command", short = 'c', help = "command to execute. 
-occurances of {index} in command will be replaced with a command autoincrement")]
+#[command(version, about, long_about = None)]
+#[command(propagate_version = true)]
+struct Cli {
+    #[command(subcommand)]
+    command: Commands,
+}
+
+#[derive(Debug, Subcommand)]
+enum Commands {
+    Run(Run),
+    Cleanup(Cleanup),
+}
+
+#[derive(Debug, Parser)]
+struct Run {
+    #[clap(
+        long = "command",
+        short = 'c',
+        help = "command to execute. 
+occurances of {index} in command will be replaced with a command autoincrement"
+    )]
     commands: Vec<String>,
     #[clap(
         long = "count",
@@ -78,7 +92,7 @@ cidr is expected to have as many addresses as th sum of all commands instances"
     work_dirs: Vec<String>,
 }
 
-impl Opt {
+impl Run {
     fn unique_name(&self) -> String {
         let mut name = String::new();
         for c in self.prefix.chars() {
@@ -91,6 +105,17 @@ impl Opt {
         }
         name
     }
+}
+
+#[derive(Debug, Parser)]
+struct Cleanup{
+    #[clap(
+        long = "prefix",
+        short = 'p',
+        help = "prefix for playground environment.",
+        default_value = "p-"
+    )]
+    prefix: String,
 }
 
 #[derive(Debug, Clone)]
@@ -112,16 +137,6 @@ impl FromStr for EnvValue {
 }
 
 fn main() {
-    let opts = Opt::parse();
-    let mut cmd = Opt::command();
-    if opts.commands.is_empty() {
-        cmd.error(
-            ErrorKind::InvalidValue,
-            "requires atleast one command to run. use --command or -c to provide commands.",
-        )
-        .exit();
-    }
-
     if let Err(e) = tracing::subscriber::set_global_default(
         tracing_subscriber::FmtSubscriber::builder()
             .with_env_filter(
@@ -131,9 +146,23 @@ fn main() {
             )
             .finish(),
     ) {
-        cmd.error(
+        Cli::command().error(
             ErrorKind::Io,
             format!("failed to set global default subscriber: {:?}", e),
+        )
+        .exit();
+    }
+    match Cli::parse().command {
+        Commands::Run(opts) => run(Cli::command(), &opts),
+        Commands::Cleanup(opts) => cleanup(Cli::command(), &opts),
+    }
+}
+
+fn run(mut cmd: Command, opts: &Run) {
+    if opts.commands.is_empty() {
+        cmd.error(
+            ErrorKind::InvalidValue,
+            "requires atleast one command to run. use --command or -c to provide commands.",
         )
         .exit();
     }
@@ -176,7 +205,7 @@ fn main() {
                     }
                     for env in &opts.env {
                         builder = builder.with_os_env(env.0.clone(), env.1.clone());
-                    } 
+                    }
                     if let Err(err) = builder.spawn() {
                         tracing::error!("failed to run command: {:?}", err);
                         return;
@@ -195,4 +224,32 @@ fn main() {
     } {
         cmd.error(ErrorKind::Io, format!("{:?}", err)).exit();
     }
+}
+
+fn cleanup(mut cmd: Command, opts: &Cleanup) {
+    let bridges = { 
+        match playground::cleanup_bridges(&opts.prefix) {
+            Ok(bridges) => bridges,
+            Err(err) => {
+                cmd.error(ErrorKind::Io, format!("{:?}", err)).exit();
+            }
+        }    
+    };
+    let namespaces = {
+        match playground::cleanup_namespaces(&opts.prefix) {
+            Ok(namespaces) => namespaces,
+            Err(err) => {
+                cmd.error(ErrorKind::Io, format!("{:?}", err)).exit();
+            }
+        }
+    };
+    let veth = {
+        match playground::cleanup_veth(&opts.prefix) {
+            Ok(veth) => veth,
+            Err(err) => {
+                cmd.error(ErrorKind::Io, format!("{:?}", err)).exit();
+            }
+        }
+    };
+    tracing::info!(bridges = ?bridges, namespaces = ?namespaces, veth = ?veth, "cleanup completed");
 }

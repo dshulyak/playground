@@ -1,15 +1,16 @@
 use std::collections::HashMap;
-use std::io::{BufReader, BufRead};
+use std::io::{BufRead, BufReader};
 use std::net::IpAddr;
 use std::process::{Child, Command, Stdio};
 use std::str::FromStr;
 use std::thread;
 
-use anyhow::{Result, Context};
+use anyhow::{Context, Result};
 use crossbeam::channel::{unbounded, Receiver, Sender};
 use ipnet::{IpAddrRange, IpNet};
 use rand::distributions::Alphanumeric;
 use rand::{thread_rng, Rng};
+use serde_json::Value;
 
 trait Actionable {
     fn apply(&self) -> Result<()>;
@@ -25,7 +26,7 @@ pub struct Env {
     veth: HashMap<String, Veth>,
     qdisc: HashMap<String, Qdisc>,
     commands: HashMap<String, Task>,
-    errors_sender:  Option<Sender<anyhow::Result<()>>>,
+    errors_sender: Option<Sender<anyhow::Result<()>>>,
     errors_receiver: Receiver<anyhow::Result<()>>,
     revert: bool,
 }
@@ -159,7 +160,7 @@ impl<'a> Builder<'a> {
         let sender = match &self.env.errors_sender {
             Some(sender) => sender.clone(),
             None => anyhow::bail!("can't spawn new tasks after the environment has been run"),
-        }; 
+        };
         _ = self.env.hosts.next();
         self.env.next += 1;
         let id = self.ns.name.clone();
@@ -189,6 +190,22 @@ impl Namespace {
             name: format!("{}-{}", prefix, index),
         }
     }
+
+    pub fn cleanup(prefix: &str) -> Result<usize> {
+        let output = shell("ip -json netns list")?;
+        let namespaces: Vec<HashMap<String, Value>> = serde_json::from_slice(&output)?;
+        let mut count = 0;
+        for ns in namespaces {
+            match ns["name"] {
+                Value::String(ref name) if name.starts_with(prefix) => {
+                    shell(&format!("ip netns del {}", name))?;
+                    count += 1;
+                }
+                _ => {}
+            }
+        }
+        Ok(count)
+    }
 }
 
 impl Actionable for Namespace {
@@ -204,6 +221,18 @@ impl Actionable for Namespace {
     }
 }
 
+pub fn cleanup_bridges(prefix: &str) -> Result<usize> {
+    Bridge::cleanup(prefix)
+}
+
+pub fn cleanup_veth(prefix: &str) -> Result<usize> {
+    Veth::cleanup(prefix)
+}
+
+pub fn cleanup_namespaces(prefix: &str) -> Result<usize> {
+    Namespace::cleanup(prefix)
+}
+
 #[derive(Debug, Clone)]
 struct Bridge {
     name: String,
@@ -214,6 +243,23 @@ impl Bridge {
         Bridge {
             name: format!("{}-br", ns),
         }
+    }
+
+    pub fn cleanup(prefix: &str) -> Result<usize> {
+        let output = shell("ip -json link show type bridge")?;
+        let bridges: Vec<HashMap<String, Value>> =
+            serde_json::from_slice(&output).context("decode bridges")?;
+        let mut count = 0;
+        for bridge in bridges {
+            match &bridge["ifname"] {
+                Value::String(ifname) if ifname.starts_with(prefix) => {
+                    shell(&format!("ip link del {}", ifname))?;
+                    count += 1;
+                }
+                _ => {}
+            }
+        }
+        Ok(count)
     }
 }
 
@@ -260,6 +306,22 @@ impl Veth {
     fn host(&self) -> String {
         format!("veth-{}-br", self.namespace.name)
     }
+
+    pub fn cleanup(prefix: &str) -> Result<usize> {
+        let output = shell("ip -json link show type veth")?;
+        let veths: Vec<HashMap<String, Value>> = serde_json::from_slice(&output)?;
+        let mut count = 0;
+        for veth in veths {
+            match &veth["ifname"] {
+                Value::String(ifname) if ifname.starts_with(prefix) => {
+                    shell(&format!("ip link del {}", ifname))?;
+                    count += 1;
+                }
+                _ => {}
+            }
+        }
+        Ok(count)
+    }
 }
 
 impl Actionable for Veth {
@@ -279,14 +341,27 @@ impl Actionable for Veth {
             self.host(),
             self.bridge.name
         ))?;
-        shell(&format!("ip -n {} addr add {} dev {}", self.namespace.name, self.addr(), self.guest()))?;
-        shell(&format!("ip -n {} link set {} up", self.namespace.name, self.guest()))?;
+        shell(&format!(
+            "ip -n {} addr add {} dev {}",
+            self.namespace.name,
+            self.addr(),
+            self.guest()
+        ))?;
+        shell(&format!(
+            "ip -n {} link set {} up",
+            self.namespace.name,
+            self.guest()
+        ))?;
         shell(&format!("ip link set {} up", self.host()))?;
         Ok(())
     }
 
     fn revert(&self) -> Result<()> {
-        shell(&format!("ip -n {} link del {}", self.namespace.name, self.guest()))?;
+        shell(&format!(
+            "ip -n {} link del {}",
+            self.namespace.name,
+            self.guest()
+        ))?;
         Ok(())
     }
 }
@@ -332,18 +407,19 @@ impl Actionable for Qdisc {
 
     fn revert(&self) -> Result<()> {
         if self.netem.is_some() || self.tbf.is_some() {
-            shell(&format!(
+            if let Err(err) = shell(&format!(
                 "ip netns exec {} tc qdisc del dev {} root",
                 self.veth.namespace.name,
                 self.veth.guest()
-            ))
-        } else {
-            Ok(())
+            )) {
+                return Result::Err(err);
+            }
         }
+        Ok(())
     }
 }
 
-fn shell(cmd: &str) -> Result<()> {
+fn shell(cmd: &str) -> Result<Vec<u8>> {
     tracing::debug!("running: {}", cmd);
     let mut parts = cmd.split_whitespace();
     let command = parts.next().unwrap().to_string();
@@ -362,7 +438,8 @@ fn shell(cmd: &str) -> Result<()> {
             String::from_utf8(output.stderr).expect("invalid utf8")
         )
     }
-    Ok(())
+
+    Ok(output.stdout)
 }
 
 fn random_suffix(n: usize) -> String {
@@ -398,15 +475,21 @@ impl Task {
         format!("ip netns exec {} {}", self.ns.name, replaced)
     }
 
-    fn spawn(&mut self, errors_sender: Sender<Result<()>>, work_dir: Option<&String>, env: &HashMap<String, String>) -> Result<()> {
+    fn spawn(
+        &mut self,
+        errors_sender: Sender<Result<()>>,
+        work_dir: Option<&String>,
+        env: &HashMap<String, String>,
+    ) -> Result<()> {
         let cmd = self.command();
         let mut splitted = cmd.split_whitespace();
         let first = splitted
             .next()
             .ok_or_else(|| anyhow::anyhow!("no command found in the command string: {}", cmd))?;
-        
+
         let mut shell = Command::new(first);
-        shell.args(splitted)
+        shell
+            .args(splitted)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         if let Some(work_dir) = work_dir {
@@ -416,9 +499,7 @@ impl Task {
             shell.env(key, value);
         }
 
-        let mut shell = shell
-            .spawn()
-            .context("failed to spawn command")?;
+        let mut shell = shell.spawn().context("failed to spawn command")?;
 
         let stdout = shell
             .stdout
@@ -447,7 +528,7 @@ impl Task {
             }
         });
         let id = self.ns.name.clone();
-        let sender= errors_sender.clone();
+        let sender = errors_sender.clone();
         let stderr_handler = thread::spawn(move || {
             let reader = BufReader::new(stderr);
             for line in reader.lines() {

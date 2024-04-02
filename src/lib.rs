@@ -16,7 +16,7 @@ trait Actionable {
     fn revert(&self) -> Result<()>;
 }
 
-struct Env {
+pub struct Env {
     prefix: String,
     hosts: IpAddrRange,
     next: usize,
@@ -27,6 +27,7 @@ struct Env {
     commands: HashMap<String, Task>,
     errors_sender:  Option<Sender<anyhow::Result<()>>>,
     errors_receiver: Receiver<anyhow::Result<()>>,
+    revert: bool,
 }
 
 impl Env {
@@ -43,7 +44,23 @@ impl Env {
             commands: HashMap::new(),
             errors_sender: Some(errors_sender),
             errors_receiver,
+            revert: true,
         }
+    }
+
+    pub fn with_prefix(mut self, prefix: String) -> Self {
+        self.prefix = prefix;
+        self
+    }
+
+    pub fn with_network(mut self, network: IpNet) -> Self {
+        self.hosts = network.hosts();
+        self
+    }
+
+    pub fn with_revert(mut self, revert: bool) -> Self {
+        self.revert = revert;
+        self
     }
 
     pub fn add(&mut self, cmd: String) -> Builder {
@@ -70,29 +87,29 @@ impl Env {
                 tracing::debug!("failed to stop task: {:?}", err);
             }
         }
-        for (_, veth) in self.veth.drain() {
-            if let Err(err) = veth.revert() {
-                tracing::debug!("failed to revert veth: {:?}", err);
-            };
-        }
-        for (_, namespace) in self.namespaces.drain() {
-            if let Err(err) = namespace.revert() {
-                tracing::debug!("failed to revert namespace: {:?}", err);
-            };
-        }
-        if let Some(bridge) = self.bridge.take() {
-            if let Err(err) = bridge.revert() {
-                tracing::debug!("failed to revert bridge: {:?}", err);
-            };
+        if self.revert {
+            for (_, veth) in self.veth.drain() {
+                if let Err(err) = veth.revert() {
+                    tracing::debug!("failed to revert veth: {:?}", err);
+                };
+            }
+            for (_, namespace) in self.namespaces.drain() {
+                if let Err(err) = namespace.revert() {
+                    tracing::debug!("failed to revert namespace: {:?}", err);
+                };
+            }
+            if let Some(bridge) = self.bridge.take() {
+                if let Err(err) = bridge.revert() {
+                    tracing::debug!("failed to revert bridge: {:?}", err);
+                };
+            }
         }
         rst
     }
 }
 
-struct Builder<'a> {
+pub struct Builder<'a> {
     env: &'a mut Env,
-    ip: IpAddr,
-    id: usize,
     ns: Namespace,
     veth: Veth,
     qdisc: Option<Qdisc>,
@@ -107,8 +124,6 @@ impl<'a> Builder<'a> {
         let veth = Veth::new(ip, env.bridge.as_ref().unwrap().clone(), ns.clone());
         Builder {
             env,
-            ip,
-            id,
             ns,
             veth,
             qdisc: None,
@@ -248,8 +263,8 @@ impl Actionable for Veth {
             self.host(),
             self.bridge.name
         ))?;
-        shell(&format!("ip addr add {} dev {}", self.addr(), self.guest()))?;
-        shell(&format!("ip link set {} up", self.guest()))?;
+        shell(&format!("ip -n {} addr add {} dev {}", self.namespace.name, self.addr(), self.guest()))?;
+        shell(&format!("ip -n {} link set {} up", self.namespace.name, self.guest()))?;
         shell(&format!("ip link set {} up", self.host()))?;
         Ok(())
     }

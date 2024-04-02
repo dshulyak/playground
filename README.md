@@ -2,7 +2,7 @@ Toolkit to test networked applications with basic chaos capabilities
 ---
 
 ```bash
-cargo build
+cargo build --manifest-path=./play/Cargo.toml
 ./target/debug/play -c "ping 10.0.0.1" -c "ping 10.0.0.2"
 ```
 

@@ -321,8 +321,10 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "crossbeam",
  "ctrlc",
  "ipnet",
+ "playground",
  "rand",
  "tracing",
  "tracing-subscriber",

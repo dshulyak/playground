@@ -5,11 +5,10 @@ edition = "2021"
 
 [workspace]
 members = ["play"]
-resolver = "2"
 
 [dependencies]
 anyhow = "1.0.80"
-crossbeam = { version = "0.8.4", features = ["crossbeam-channel"] } 
+crossbeam = { version = "0.8.4", features = ["crossbeam-channel"] }
 ipnet = "2.9.0"
 rand = "0.8.5"
 tracing = "0.1.40"

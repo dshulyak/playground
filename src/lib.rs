@@ -110,6 +110,7 @@ impl Env {
 
 pub struct Builder<'a> {
     env: &'a mut Env,
+    index: usize,
     ns: Namespace,
     veth: Veth,
     qdisc: Option<Qdisc>,
@@ -118,12 +119,13 @@ pub struct Builder<'a> {
 
 impl<'a> Builder<'a> {
     fn new(env: &'a mut Env, cmd: String) -> Self {
-        let id = env.next;
+        let index = env.next;
         let ip = env.hosts.peekable().peek().map(|ip| *ip).unwrap();
-        let ns = Namespace::new(&env.prefix, id);
+        let ns = Namespace::new(&env.prefix, index);
         let veth = Veth::new(ip, env.bridge.as_ref().unwrap().clone(), ns.clone());
         Builder {
             env,
+            index,
             ns,
             veth,
             qdisc: None,
@@ -155,7 +157,7 @@ impl<'a> Builder<'a> {
             self.env.qdisc.insert(id.clone(), qdisc.clone());
             qdisc.apply()?;
         }
-        let mut task = Task::new(self.ns.clone(), self.command);
+        let mut task = Task::new(self.index, self.ns.clone(), self.command);
         task.spawn(sender)?;
         self.env.commands.insert(id.clone(), task);
         Ok(())
@@ -358,6 +360,7 @@ fn random_suffix(n: usize) -> String {
 }
 
 struct Task {
+    index: usize,
     ns: Namespace,
     cmd: String,
     handlers: Vec<thread::JoinHandle<()>>,
@@ -365,8 +368,9 @@ struct Task {
 }
 
 impl Task {
-    fn new(ns: Namespace, cmd: String) -> Self {
+    fn new(index: usize, ns: Namespace, cmd: String) -> Self {
         Task {
+            index,
             ns,
             cmd,
             handlers: vec![],
@@ -375,7 +379,9 @@ impl Task {
     }
 
     fn command(&self) -> String {
-        format!("ip netns exec {} {}", self.ns.name, self.cmd)
+        // replace index in the command
+        let replaced = self.cmd.replace("{index}", &self.index.to_string());
+        format!("ip netns exec {} {}", self.ns.name, replaced)
     }
 
     fn spawn(&mut self, errors_sender: Sender<Result<()>>) -> Result<()> {

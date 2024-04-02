@@ -11,7 +11,8 @@ use tracing::metadata::LevelFilter;
     about = "run several commands in their network namespace, introducing network latency and shaping traffic."
 )]
 struct Opt {
-    #[clap(long = "command", short = 'c', help = "command to execute")]
+    #[clap(long = "command", short = 'c', help = "command to execute. 
+occurances of {index} in command will be replaced with a command autoincrement")]
     commands: Vec<String>,
     #[clap(
         long = "count",

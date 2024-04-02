@@ -24,12 +24,19 @@ otherwise the number of counts must match the number of commands."
     counts: Vec<usize>,
     #[clap(
         long = "tbf",
-        help = "man tbf. it is passed as is to tc qdisc after tbf keyword."
+        help = "man tbf. it is passed as is to tc qdisc after tbf keyword.
+EXAMPLES: 
+--tbf 'rate 1mbit burst 80kbit latency 100ms'
+"
     )]
     tbf: Vec<String>,
     #[clap(
         long = "netem",
-        help = "man netem. it is passed as is to tc qdisc after netem keyword."
+        help = "man netem. it is passed as is to tc qdisc after netem keyword.
+EXAMPLES:
+--netem 'delay 100ms loss 2%' // fixed delay of 100ms and 2% packet loss on every interface
+--netem 'delay 100ms 50ms'    // variable delay of 100ms with 50ms jitter on every interface 
+"
     )]
     netem: Vec<String>,
     #[clap(
@@ -45,7 +52,6 @@ otherwise the number of counts must match the number of commands."
 cidr is expected to have as many addresses as th sum of all commands instances"
     )]
     cidr: ipnet::IpNet,
-
     #[clap(
         long = "prefix",
         short = 'p',
@@ -53,14 +59,11 @@ cidr is expected to have as many addresses as th sum of all commands instances"
         default_value = "p-XXX"
     )]
     prefix: String,
-    // #[clap(help = "periodic signal to send to the command.")]
-    // signal: Vec<String>,
-    // #[clap(help = "periodically terminate the command, and restart it after a given delay.")]
-    // terminate: Vec<String>,
-    // #[clap(
-    //     help = "periodically stop the command. unlike terminate, the command with be stopped with SIGSTOP, and resumed later"
-    // )]
-    // stop: Vec<String>,
+    #[clap(
+        long = "shutdown",
+        help = "periodically shutdown the command, and restart it after a given delay."
+    )]
+    shutdown: Vec<String>,
     #[clap(
         long = "no-revert",
         help = "do not revert the changes made to the network configuration."
@@ -146,10 +149,20 @@ fn main() {
             .with_prefix(opts.unique_name())
             .with_revert(!opts.no_revert);
         env.run(|e| {
+            let first_tbf = opts.tbf.first().map(|t| t.clone());
+            let first_netem = opts.netem.first().map(|n| n.clone());
+            let first_count = opts.counts.first().copied().unwrap_or(1);
             for (i, cmd) in opts.commands.iter().enumerate() {
-                let count = opts.counts.get(i).copied().unwrap_or(1);
-                for _ in 0..count {
-                    if let Err(err) = e.add(cmd.clone()).spawn() {
+                for _ in 0..opts.counts.get(i).copied().unwrap_or(first_count) {
+                    let tbf = opts
+                        .tbf
+                        .get(i)
+                        .map_or(first_tbf.clone(), |t| Some(t.clone()));
+                    let netem = opts
+                        .netem
+                        .get(i)
+                        .map_or(first_netem.clone(), |n| Some(n.clone()));
+                    if let Err(err) = e.add(cmd.clone()).with_qdisc(tbf, netem).spawn() {
                         tracing::error!("failed to run command: {:?}", err);
                         return;
                     };
@@ -157,7 +170,7 @@ fn main() {
             }
             select! {
                 recv(tx) -> _ => {
-                    tracing::info!("received interrupt. wait for program to cleanup");
+                    tracing::debug!("received interrupt on the channel");
                 }
                 recv(e.errors()) -> err => {
                     tracing::error!("error in playground: {:?}", err);

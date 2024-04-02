@@ -270,7 +270,7 @@ impl Actionable for Veth {
     }
 
     fn revert(&self) -> Result<()> {
-        shell(&format!("ip link del {}", self.guest()))?;
+        shell(&format!("ip -n {} link del {}", self.namespace.name, self.guest()))?;
         Ok(())
     }
 }
@@ -301,7 +301,7 @@ impl Actionable for Qdisc {
         if let Some(netem) = &self.netem {
             let handle = match self.tbf {
                 None => "root handle 1",
-                Some(_) => "parent handle 1 handle 10",
+                Some(_) => "parent 1:1 handle 10",
             };
             shell(&format!(
                 "ip netns exec {} tc qdisc add dev {} {}: netem {}",

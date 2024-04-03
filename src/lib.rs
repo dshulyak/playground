@@ -182,11 +182,18 @@ impl<'a> Builder<'a> {
             self.env.qdisc.insert(id.clone(), qdisc.clone());
             qdisc.apply()?;
         }
-        let mut task = Task::new(self.index, self.ns.clone(), self.command);
-
         let current_dir = env::current_dir().context("failed to get current directory")?;
         let work_dir = self.work_dir.as_ref().unwrap_or_else(|| &current_dir);
-        task.spawn(sender, work_dir, &self.os_env, self.env.redirect)?;
+        let mut task = Task::new(
+            self.index,
+            self.ns.clone(),
+            self.command,
+            self.env.redirect,
+            sender,
+            work_dir.clone(),
+            self.os_env,
+        );
+        task.start()?;
         self.env.commands.insert(id.clone(), task);
         Ok(())
     }
@@ -467,18 +474,34 @@ struct Task {
     index: usize,
     ns: Namespace,
     cmd: String,
+    redirect: bool,
     handlers: Vec<thread::JoinHandle<()>>,
     process: Option<Child>,
+    errors_sender: Sender<Result<()>>,
+    work_dir: PathBuf,
+    env: HashMap<String, String>,
 }
 
 impl Task {
-    fn new(index: usize, ns: Namespace, cmd: String) -> Self {
+    fn new(
+        index: usize,
+        ns: Namespace,
+        cmd: String,
+        redirect: bool,
+        errors_sender: Sender<Result<()>>,
+        work_dir: PathBuf,
+        env: HashMap<String, String>,
+    ) -> Self {
         Task {
             index,
             ns,
             cmd,
             handlers: vec![],
             process: None,
+            redirect,
+            errors_sender,
+            work_dir,
+            env,
         }
     }
 
@@ -488,13 +511,7 @@ impl Task {
         format!("ip netns exec {} {}", self.ns.name, replaced)
     }
 
-    fn spawn(
-        &mut self,
-        errors_sender: Sender<Result<()>>,
-        work_dir: &PathBuf,
-        env: &HashMap<String, String>,
-        redirect: bool,
-    ) -> Result<()> {
+    fn start(&mut self) -> Result<()> {
         let cmd = self.command();
         let mut splitted = cmd.split_whitespace();
         let first = splitted
@@ -503,26 +520,28 @@ impl Task {
 
         let mut shell = Command::new(first);
         shell.args(splitted);
-        shell.current_dir(work_dir);
-        if !redirect {
+        shell.current_dir(&self.work_dir);
+        if !self.redirect {
             shell.stdout(Stdio::piped()).stderr(Stdio::piped());
         } else {
             let stdout = OpenOptions::new()
-                .append(true).create(true)
-                .open(work_dir.join(format!("{}.stdout", self.ns.name)))?;
+                .append(true)
+                .create(true)
+                .open(self.work_dir.join(format!("{}.stdout", self.ns.name)))?;
             let stderr = OpenOptions::new()
-                .append(true).create(true)
-                .open(work_dir.join(format!("{}.stderr", self.ns.name)))?;
+                .append(true)
+                .create(true)
+                .open(self.work_dir.join(format!("{}.stderr", self.ns.name)))?;
             shell.stdout(stdout).stderr(stderr);
         }
 
-        for (key, value) in env {
+        for (key, value) in &self.env {
             shell.env(key, value);
         }
 
         let mut shell = shell.spawn().context("failed to spawn command")?;
 
-        if !redirect {
+        if !self.redirect {
             let stdout = shell
                 .stdout
                 .take()
@@ -534,7 +553,7 @@ impl Task {
                 .ok_or_else(|| anyhow::anyhow!("failed to take stderr from child process"))?;
 
             let id = self.ns.name.clone();
-            let sender = errors_sender.clone();
+            let sender = self.errors_sender.clone();
             let stdout_handler = thread::spawn(move || {
                 let reader = BufReader::new(stdout);
                 for line in reader.lines() {
@@ -550,7 +569,7 @@ impl Task {
                 }
             });
             let id = self.ns.name.clone();
-            let sender = errors_sender.clone();
+            let sender = self.errors_sender.clone();
             let stderr_handler = thread::spawn(move || {
                 let reader = BufReader::new(stderr);
                 for line in reader.lines() {

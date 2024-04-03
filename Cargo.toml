@@ -9,6 +9,7 @@ members = ["play"]
 [dependencies]
 anyhow = "1.0.80"
 crossbeam = { version = "0.8.4", features = ["crossbeam-channel"] }
+humantime = "2.1.0"
 ipnet = "2.9.0"
 rand = "0.8.5"
 serde_json = "1.0.115"

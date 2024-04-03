@@ -2,7 +2,7 @@ use anyhow::Result;
 use clap::{error::ErrorKind, Command, CommandFactory, Parser, Subcommand};
 use crossbeam::{channel::unbounded, select};
 use playground::Env;
-use std::str::FromStr;
+use std::{path::PathBuf, str::FromStr};
 use tracing::metadata::LevelFilter;
 
 #[derive(Debug, Parser)]
@@ -89,7 +89,12 @@ cidr is expected to have as many addresses as th sum of all commands instances"
         long = "work-dir",
         help = "working directory for the command."
     )]
-    work_dirs: Vec<String>,
+    work_dirs: Vec<PathBuf>,
+    #[clap(
+        long = "redirect",
+        help = "redirect stdout and stderr to work_dir/namespace.{stdout, stderr} files."
+    )]
+    redirect: bool,
 }
 
 impl Run {
@@ -108,7 +113,7 @@ impl Run {
 }
 
 #[derive(Debug, Parser)]
-struct Cleanup{
+struct Cleanup {
     #[clap(
         long = "prefix",
         short = 'p',
@@ -146,11 +151,12 @@ fn main() {
             )
             .finish(),
     ) {
-        Cli::command().error(
-            ErrorKind::Io,
-            format!("failed to set global default subscriber: {:?}", e),
-        )
-        .exit();
+        Cli::command()
+            .error(
+                ErrorKind::Io,
+                format!("failed to set global default subscriber: {:?}", e),
+            )
+            .exit();
     }
     match Cli::parse().command {
         Commands::Run(opts) => run(Cli::command(), &opts),
@@ -183,7 +189,8 @@ fn run(mut cmd: Command, opts: &Run) {
         let env = Env::new()
             .with_network(opts.cidr.clone())
             .with_prefix(opts.unique_name())
-            .with_revert(!opts.no_revert);
+            .with_revert(!opts.no_revert)
+            .with_redirect(opts.redirect);
         env.run(|e| {
             let first_tbf = opts.tbf.first().map(|t| t.clone());
             let first_netem = opts.netem.first().map(|n| n.clone());
@@ -227,13 +234,13 @@ fn run(mut cmd: Command, opts: &Run) {
 }
 
 fn cleanup(mut cmd: Command, opts: &Cleanup) {
-    let bridges = { 
+    let bridges = {
         match playground::cleanup_bridges(&opts.prefix) {
             Ok(bridges) => bridges,
             Err(err) => {
                 cmd.error(ErrorKind::Io, format!("{:?}", err)).exit();
             }
-        }    
+        }
     };
     let namespaces = {
         match playground::cleanup_namespaces(&opts.prefix) {

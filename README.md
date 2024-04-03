@@ -1,6 +1,8 @@
-Toolkit to test networked applications with basic chaos capabilities
+Toolkit for testing and debugging distributed applications with basic chaos capabilities.
 ---
 
+## How to use?
+### Command line
 ```bash
 cargo build --manifest-path=./play/Cargo.toml
 export PATH=$PATH:./target/debug/
@@ -14,7 +16,10 @@ play run -c "ping 10.0.0.1" -c "ping 10.0.0.2" --netem='delay 10ms'
 play cleanup
 ```
 
-- [ ] write logs from commands to selected locations instead of stdout
+### Library
+
+
+## TODO
 - [ ] spawn supervised commands that can be killed or stopped periodically
     --shutdown 'every 30m 30s pause 20m 30s' 
     every 30 minutes kill process pause for 20 minutes
@@ -25,5 +30,9 @@ play cleanup
     --partition '50% 30% 20% every 30m duration 10s'
     --partition '1,2 3 4,5 every 30m duration 10s'
     can do it with nft by dropping traffic on the bridge that is from src => dst and dst => src
-- [ ] slow/faulty disk emulation 
-    need to research how it can be done
+- [ ] slow/faulty disk emulation
+    not clear if i will use it.
+- [ ] cgroups v2 for memory and cpu shares
+    not clear if i will use it.
+- [ ] distribute environment.
+    very complicated. likely out of scope

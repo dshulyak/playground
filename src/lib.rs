@@ -1,9 +1,11 @@
 use std::collections::HashMap;
+use std::fs::OpenOptions;
 use std::io::{BufRead, BufReader};
 use std::net::IpAddr;
+use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::str::FromStr;
-use std::thread;
+use std::{env, thread};
 
 use anyhow::{Context, Result};
 use crossbeam::channel::{unbounded, Receiver, Sender};
@@ -29,6 +31,8 @@ pub struct Env {
     errors_sender: Option<Sender<anyhow::Result<()>>>,
     errors_receiver: Receiver<anyhow::Result<()>>,
     revert: bool,
+    // redirect stdout and stderr to files in the working directories
+    redirect: bool,
 }
 
 impl Env {
@@ -46,6 +50,7 @@ impl Env {
             errors_sender: Some(errors_sender),
             errors_receiver,
             revert: true,
+            redirect: false,
         }
     }
 
@@ -61,6 +66,11 @@ impl Env {
 
     pub fn with_revert(mut self, revert: bool) -> Self {
         self.revert = revert;
+        self
+    }
+
+    pub fn with_redirect(mut self, redirect: bool) -> Self {
+        self.redirect = redirect;
         self
     }
 
@@ -116,7 +126,7 @@ pub struct Builder<'a> {
     veth: Veth,
     qdisc: Option<Qdisc>,
     command: String,
-    work_dir: Option<String>,
+    work_dir: Option<PathBuf>,
     os_env: HashMap<String, String>,
 }
 
@@ -146,7 +156,7 @@ impl<'a> Builder<'a> {
         self
     }
 
-    pub fn with_work_dir(mut self, work_dir: String) -> Self {
+    pub fn with_work_dir(mut self, work_dir: PathBuf) -> Self {
         self.work_dir = Some(work_dir);
         self
     }
@@ -173,7 +183,10 @@ impl<'a> Builder<'a> {
             qdisc.apply()?;
         }
         let mut task = Task::new(self.index, self.ns.clone(), self.command);
-        task.spawn(sender, self.work_dir.as_ref(), &self.os_env)?;
+
+        let current_dir = env::current_dir().context("failed to get current directory")?;
+        let work_dir = self.work_dir.as_ref().unwrap_or_else(|| &current_dir);
+        task.spawn(sender, work_dir, &self.os_env, self.env.redirect)?;
         self.env.commands.insert(id.clone(), task);
         Ok(())
     }
@@ -478,8 +491,9 @@ impl Task {
     fn spawn(
         &mut self,
         errors_sender: Sender<Result<()>>,
-        work_dir: Option<&String>,
+        work_dir: &PathBuf,
         env: &HashMap<String, String>,
+        redirect: bool,
     ) -> Result<()> {
         let cmd = self.command();
         let mut splitted = cmd.split_whitespace();
@@ -488,64 +502,74 @@ impl Task {
             .ok_or_else(|| anyhow::anyhow!("no command found in the command string: {}", cmd))?;
 
         let mut shell = Command::new(first);
-        shell
-            .args(splitted)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        if let Some(work_dir) = work_dir {
-            shell.current_dir(work_dir);
+        shell.args(splitted);
+        shell.current_dir(work_dir);
+        if !redirect {
+            shell.stdout(Stdio::piped()).stderr(Stdio::piped());
+        } else {
+            let stdout = OpenOptions::new()
+                .append(true).create(true)
+                .open(work_dir.join(format!("{}.stdout", self.ns.name)))?;
+            let stderr = OpenOptions::new()
+                .append(true).create(true)
+                .open(work_dir.join(format!("{}.stderr", self.ns.name)))?;
+            shell.stdout(stdout).stderr(stderr);
         }
+
         for (key, value) in env {
             shell.env(key, value);
         }
 
         let mut shell = shell.spawn().context("failed to spawn command")?;
 
-        let stdout = shell
-            .stdout
-            .take()
-            .ok_or_else(|| anyhow::anyhow!("failed to take stdout from child process"))?;
+        if !redirect {
+            let stdout = shell
+                .stdout
+                .take()
+                .ok_or_else(|| anyhow::anyhow!("failed to take stdout from child process"))?;
 
-        let stderr = shell
-            .stderr
-            .take()
-            .ok_or_else(|| anyhow::anyhow!("failed to take stderr from child process"))?;
+            let stderr = shell
+                .stderr
+                .take()
+                .ok_or_else(|| anyhow::anyhow!("failed to take stderr from child process"))?;
 
-        let id = self.ns.name.clone();
-        let sender = errors_sender.clone();
-        let stdout_handler = thread::spawn(move || {
-            let reader = BufReader::new(stdout);
-            for line in reader.lines() {
-                match line {
-                    Ok(line) => {
-                        tracing::info!("[{}]: {}", id, line);
-                    }
-                    Err(e) => {
-                        let _ = sender.send(Err(e.into()));
-                        return;
+            let id = self.ns.name.clone();
+            let sender = errors_sender.clone();
+            let stdout_handler = thread::spawn(move || {
+                let reader = BufReader::new(stdout);
+                for line in reader.lines() {
+                    match line {
+                        Ok(line) => {
+                            tracing::info!("[{}]: {}", id, line);
+                        }
+                        Err(e) => {
+                            let _ = sender.send(Err(e.into()));
+                            return;
+                        }
                     }
                 }
-            }
-        });
-        let id = self.ns.name.clone();
-        let sender = errors_sender.clone();
-        let stderr_handler = thread::spawn(move || {
-            let reader = BufReader::new(stderr);
-            for line in reader.lines() {
-                match line {
-                    Ok(line) => {
-                        tracing::info!("[{}]: {}", id, line);
-                    }
-                    Err(e) => {
-                        let _ = sender.send(Err(e.into()));
-                        return;
+            });
+            let id = self.ns.name.clone();
+            let sender = errors_sender.clone();
+            let stderr_handler = thread::spawn(move || {
+                let reader = BufReader::new(stderr);
+                for line in reader.lines() {
+                    match line {
+                        Ok(line) => {
+                            tracing::info!("[{}]: {}", id, line);
+                        }
+                        Err(e) => {
+                            let _ = sender.send(Err(e.into()));
+                            return;
+                        }
                     }
                 }
-            }
-        });
+            });
+            self.handlers.push(stdout_handler);
+            self.handlers.push(stderr_handler);
+        }
+
         self.process = Some(shell);
-        self.handlers.push(stdout_handler);
-        self.handlers.push(stderr_handler);
         Ok(())
     }
 

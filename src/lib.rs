@@ -1,23 +1,25 @@
-use std::collections::HashMap;
+use std::collections::{HashMap};
 use std::fs::OpenOptions;
 use std::io::{BufRead, BufReader};
-use std::net::IpAddr;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::str::FromStr;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 use std::{env, thread};
 
 use anyhow::{Context, Result};
 use crossbeam::channel::{unbounded, Receiver, Sender};
+use crossbeam::select;
 use ipnet::{IpAddrRange, IpNet};
 use rand::distributions::Alphanumeric;
 use rand::{thread_rng, Rng};
-use serde_json::Value;
 
-trait Actionable {
-    fn apply(&self) -> Result<()>;
-    fn revert(&self) -> Result<()>;
-}
+mod network;
+mod periodic;
+
+use crate::network::{Bridge, Namespace, Qdisc, Veth};
+use crate::periodic::{MinInstantHeap, MinInstantEntry};
 
 pub struct Env {
     prefix: String,
@@ -199,48 +201,6 @@ impl<'a> Builder<'a> {
     }
 }
 
-#[derive(Debug, Clone)]
-struct Namespace {
-    name: String,
-}
-
-impl Namespace {
-    fn new(prefix: &str, index: usize) -> Self {
-        Self {
-            name: format!("{}-{}", prefix, index),
-        }
-    }
-
-    pub fn cleanup(prefix: &str) -> Result<usize> {
-        let output = shell("ip -json netns list")?;
-        let namespaces: Vec<HashMap<String, Value>> = serde_json::from_slice(&output)?;
-        let mut count = 0;
-        for ns in namespaces {
-            match ns["name"] {
-                Value::String(ref name) if name.starts_with(prefix) => {
-                    shell(&format!("ip netns del {}", name))?;
-                    count += 1;
-                }
-                _ => {}
-            }
-        }
-        Ok(count)
-    }
-}
-
-impl Actionable for Namespace {
-    fn apply(&self) -> Result<()> {
-        shell(&format!("ip netns add {}", self.name))?;
-        shell(&format!("ip netns exec {} ip link set lo up", self.name))?;
-        Ok(())
-    }
-
-    fn revert(&self) -> Result<()> {
-        shell(&format!("ip netns del {}", self.name))?;
-        Ok(())
-    }
-}
-
 pub fn cleanup_bridges(prefix: &str) -> Result<usize> {
     Bridge::cleanup(prefix)
 }
@@ -253,214 +213,6 @@ pub fn cleanup_namespaces(prefix: &str) -> Result<usize> {
     Namespace::cleanup(prefix)
 }
 
-#[derive(Debug, Clone)]
-struct Bridge {
-    name: String,
-}
-
-impl Bridge {
-    fn new(ns: &str) -> Self {
-        Bridge {
-            name: format!("{}-br", ns),
-        }
-    }
-
-    pub fn cleanup(prefix: &str) -> Result<usize> {
-        let output = shell("ip -json link show type bridge")?;
-        let bridges: Vec<HashMap<String, Value>> =
-            serde_json::from_slice(&output).context("decode bridges")?;
-        let mut count = 0;
-        for bridge in bridges {
-            match &bridge["ifname"] {
-                Value::String(ifname) if ifname.starts_with(prefix) => {
-                    shell(&format!("ip link del {}", ifname))?;
-                    count += 1;
-                }
-                _ => {}
-            }
-        }
-        Ok(count)
-    }
-}
-
-impl Actionable for Bridge {
-    fn apply(&self) -> Result<()> {
-        shell(&format!("ip link add {} type bridge", self.name))?;
-        shell(&format!("ip link set {} up", self.name))?;
-        Ok(())
-    }
-
-    fn revert(&self) -> Result<()> {
-        shell(&format!("ip link del {}", self.name))?;
-        Ok(())
-    }
-}
-
-#[derive(Debug, Clone)]
-struct Veth {
-    addr: IpAddr,
-    bridge: Bridge,
-    namespace: Namespace,
-}
-
-impl Veth {
-    fn new(addr: IpAddr, bridge: Bridge, namespace: Namespace) -> Self {
-        Veth {
-            addr,
-            bridge,
-            namespace,
-        }
-    }
-
-    fn addr(&self) -> String {
-        match self.addr {
-            IpAddr::V4(addr) => format!("{}/24", addr),
-            IpAddr::V6(addr) => format!("{}/64", addr),
-        }
-    }
-
-    fn guest(&self) -> String {
-        format!("veth-{}-ns", self.namespace.name)
-    }
-
-    fn host(&self) -> String {
-        format!("veth-{}-br", self.namespace.name)
-    }
-
-    pub fn cleanup(prefix: &str) -> Result<usize> {
-        let output = shell("ip -json link show type veth")?;
-        let veths: Vec<HashMap<String, Value>> = serde_json::from_slice(&output)?;
-        let mut count = 0;
-        for veth in veths {
-            match &veth["ifname"] {
-                Value::String(ifname) if ifname.starts_with(prefix) => {
-                    shell(&format!("ip link del {}", ifname))?;
-                    count += 1;
-                }
-                _ => {}
-            }
-        }
-        Ok(count)
-    }
-}
-
-impl Actionable for Veth {
-    fn apply(&self) -> Result<()> {
-        shell(&format!(
-            "ip link add {} type veth peer name {}",
-            self.guest(),
-            self.host()
-        ))?;
-        shell(&format!(
-            "ip link set {} netns {}",
-            self.guest(),
-            self.namespace.name
-        ))?;
-        shell(&format!(
-            "ip link set {} master {}",
-            self.host(),
-            self.bridge.name
-        ))?;
-        shell(&format!(
-            "ip -n {} addr add {} dev {}",
-            self.namespace.name,
-            self.addr(),
-            self.guest()
-        ))?;
-        shell(&format!(
-            "ip -n {} link set {} up",
-            self.namespace.name,
-            self.guest()
-        ))?;
-        shell(&format!("ip link set {} up", self.host()))?;
-        Ok(())
-    }
-
-    fn revert(&self) -> Result<()> {
-        shell(&format!(
-            "ip -n {} link del {}",
-            self.namespace.name,
-            self.guest()
-        ))?;
-        Ok(())
-    }
-}
-
-#[derive(Debug, Clone)]
-struct Qdisc {
-    veth: Veth,
-    tbf: Option<String>,
-    netem: Option<String>,
-}
-
-impl Qdisc {
-    fn new(veth: Veth, tbf: Option<String>, netem: Option<String>) -> Self {
-        Qdisc { veth, tbf, netem }
-    }
-}
-
-impl Actionable for Qdisc {
-    fn apply(&self) -> Result<()> {
-        if let Some(tbf) = &self.tbf {
-            shell(&format!(
-                "ip netns exec {} tc qdisc add dev {} root handle 1: tbf {}",
-                self.veth.namespace.name,
-                self.veth.guest(),
-                tbf
-            ))?;
-        }
-        if let Some(netem) = &self.netem {
-            let handle = match self.tbf {
-                None => "root handle 1",
-                Some(_) => "parent 1:1 handle 10",
-            };
-            shell(&format!(
-                "ip netns exec {} tc qdisc add dev {} {}: netem {}",
-                self.veth.namespace.name,
-                self.veth.guest(),
-                handle,
-                netem
-            ))?;
-        }
-        Ok(())
-    }
-
-    fn revert(&self) -> Result<()> {
-        if self.netem.is_some() || self.tbf.is_some() {
-            if let Err(err) = shell(&format!(
-                "ip netns exec {} tc qdisc del dev {} root",
-                self.veth.namespace.name,
-                self.veth.guest()
-            )) {
-                return Result::Err(err);
-            }
-        }
-        Ok(())
-    }
-}
-
-fn shell(cmd: &str) -> Result<Vec<u8>> {
-    tracing::debug!("running: {}", cmd);
-    let mut parts = cmd.split_whitespace();
-    let command = parts.next().unwrap().to_string();
-    let args: Vec<_> = parts.map(|s| s.to_string()).collect();
-
-    let shell = Command::new(command)
-        .args(args)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?;
-    let output = shell.wait_with_output()?;
-    if !output.status.success() {
-        anyhow::bail!(
-            "{}. stderr: {}",
-            cmd,
-            String::from_utf8(output.stderr).expect("invalid utf8")
-        )
-    }
-
-    Ok(output.stdout)
-}
 
 fn random_suffix(n: usize) -> String {
     thread_rng()
@@ -470,6 +222,7 @@ fn random_suffix(n: usize) -> String {
         .collect()
 }
 
+#[derive(Debug)]
 struct Task {
     index: usize,
     ns: Namespace,
@@ -607,5 +360,188 @@ impl Task {
             }
         }
         Ok(())
+    }
+}
+
+#[derive(Debug)]
+struct ShutdownTask {
+    task: Arc<Mutex<Task>>,
+    shutdown: Shutdown,
+}
+
+#[derive(Debug)]
+struct Shutdown {
+    interval: Duration,
+    interval_jitter: Option<Duration>,
+    pause: Option<Duration>,
+    pause_jitter: Option<Duration>,
+}
+
+impl Shutdown {
+    pub fn parse(input: &str) -> Result<Shutdown> {
+        let mut parts = input.split(' ');
+        let interval = match parts.next() {
+            Some("interval") => {
+                let interval = parts
+                    .next()
+                    .ok_or_else(|| anyhow::anyhow!("interval is required"))?;
+                humantime::parse_duration(interval)?
+            }
+            Some(other) => return Err(anyhow::anyhow!("unknown keyword: {}", other)),
+            None => return Err(anyhow::anyhow!("interval is required")),
+        };
+        let mut token = parts.next();
+        let interval_jitter = match token {
+            Some("jitter") => {
+                let interval_jitter = parts
+                    .next()
+                    .ok_or_else(|| anyhow::anyhow!("interval jitter is required"))?;
+                Some(humantime::parse_duration(interval_jitter)?)
+            }
+            Some(other) => return Err(anyhow::anyhow!("unknown keyword: {}", other)),
+            None => None,
+        };
+        if token.is_some() {
+            token = parts.next();
+        }
+        let pause = match token {
+            Some("pause") => {
+                let pause = parts
+                    .next()
+                    .ok_or_else(|| anyhow::anyhow!("pause is required"))?;
+                Some(humantime::parse_duration(pause)?)
+            }
+            Some(other) => return Err(anyhow::anyhow!("unknown keyword: {}", other)),
+            None => None,
+        };
+        let pause_jitter = {
+            if pause.is_none() {
+                None
+            } else {
+                match parts.next() {
+                    Some("jitter") => {
+                        let pause_jitter = parts
+                            .next()
+                            .ok_or_else(|| anyhow::anyhow!("pause jitter is required"))?;
+                        Some(humantime::parse_duration(pause_jitter)?)
+                    }
+                    Some(other) => return Err(anyhow::anyhow!("unknown keyword: {}", other)),
+                    None => None,
+                }
+            }
+        };
+        Ok(Shutdown {
+            interval,
+            interval_jitter,
+            pause,
+            pause_jitter,
+        })
+    }
+}
+
+struct ShutdownActor {
+    send: Sender<ShutdownTask>,
+    recv: Receiver<ShutdownTask>,
+    to_pause: MinInstantHeap<ShutdownTask>,
+    to_start: MinInstantHeap<ShutdownTask>,
+}
+
+impl ShutdownActor {
+    fn new() -> Self {
+        let (send, recv) = unbounded();
+        Self {
+            send,
+            recv,
+            to_pause: MinInstantHeap::new(),
+            to_start: MinInstantHeap::new(),
+        }
+    }
+
+    fn send(&self, shutdown: ShutdownTask) {
+        self.send.send(shutdown).unwrap();
+    }
+
+    fn on_receive(&mut self, stask: ShutdownTask) {
+        self.to_pause.push(MinInstantEntry {
+            timestamp: Instant::now() + stask.shutdown.interval,
+            task: stask,
+        });
+    }
+
+    fn wakeup(&self) -> Option<Duration> {
+        self.to_pause
+            .peek()
+            .map(|entry| entry.timestamp)
+            .min(self.to_start.peek().map(|entry| entry.timestamp))
+            .map(|min| min.saturating_duration_since(Instant::now()))
+    }
+
+    fn pause_tasks(&mut self) {
+        let now = Instant::now();
+        while let Some(entry) = self.to_pause.peek() {
+            if entry.timestamp > now {
+                break;
+            }
+            let entry = self.to_pause.pop().unwrap();
+            if let Err(err) = entry.task.task.lock().unwrap().stop() {
+                tracing::error!("failed to stop task: {:?}", err);
+            }
+            if let Some(pause) = entry.task.shutdown.pause {
+                self.to_start.push(MinInstantEntry {
+                    timestamp: Instant::now() + pause,
+                    task: entry.task,
+                });
+            } else {
+                if let Err(err) = entry.task.task.lock().unwrap().start() {
+                    tracing::error!("failed to start task: {:?}", err);
+                }
+                self.to_pause.push(MinInstantEntry {
+                    timestamp: Instant::now() + entry.task.shutdown.interval,
+                    task: entry.task,
+                });
+            }
+        }
+    }
+
+    fn start_tasks(&mut self) {
+        let now = Instant::now();
+        while let Some(entry) = self.to_start.peek() {
+            if entry.timestamp > now {
+                break;
+            }
+            let entry = self.to_start.pop().unwrap();
+            if let Err(err) = entry.task.task.lock().unwrap().start() {
+                tracing::error!("failed to start task: {:?}", err);
+            }
+            self.to_pause.push(MinInstantEntry {
+                timestamp: Instant::now() + entry.task.shutdown.interval,
+                task: entry.task,
+            });
+        }
+    }
+
+    fn run(&mut self) {
+        loop {
+            match self.wakeup() {
+                Some(duration) if duration > Duration::from_nanos(0) => {
+                    select! {
+                        recv(self.recv) -> task => {
+                            self.on_receive(task.unwrap());
+                        }
+                        default(duration) => {}
+                    };
+                }
+                Some(_) => {}
+                None => {
+                    select! {
+                        recv(self.recv) -> task => {
+                            self.on_receive(task.unwrap());
+                        }
+                    };
+                }
+            };
+            self.pause_tasks();
+            self.start_tasks();
+        }
     }
 }

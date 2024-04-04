@@ -1,4 +1,4 @@
-use std::collections::{HashMap};
+use std::collections::HashMap;
 use std::fs::OpenOptions;
 use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
@@ -19,7 +19,7 @@ mod network;
 mod periodic;
 
 use crate::network::{Bridge, Namespace, Qdisc, Veth};
-use crate::periodic::{MinInstantHeap, MinInstantEntry};
+use crate::periodic::{MinInstantEntry, MinInstantHeap};
 
 pub struct Env {
     prefix: String,
@@ -29,12 +29,13 @@ pub struct Env {
     namespaces: HashMap<String, Namespace>,
     veth: HashMap<String, Veth>,
     qdisc: HashMap<String, Qdisc>,
-    commands: HashMap<String, Task>,
+    tasks: HashMap<String, Arc<Mutex<Task>>>,
     errors_sender: Option<Sender<anyhow::Result<()>>>,
     errors_receiver: Receiver<anyhow::Result<()>>,
     revert: bool,
     // redirect stdout and stderr to files in the working directories
     redirect: bool,
+    shutdown_actor: Arc<ShutdownActor>,
 }
 
 impl Env {
@@ -48,11 +49,12 @@ impl Env {
             namespaces: HashMap::new(),
             veth: HashMap::new(),
             qdisc: HashMap::new(),
-            commands: HashMap::new(),
+            tasks: HashMap::new(),
             errors_sender: Some(errors_sender),
             errors_receiver,
             revert: true,
             redirect: false,
+            shutdown_actor: Arc::new(ShutdownActor::new()),
         }
     }
 
@@ -85,6 +87,10 @@ impl Env {
     }
 
     pub fn run(mut self, f: impl FnOnce(&mut Self)) -> Result<()> {
+        let background = self.shutdown_actor.clone();
+        thread::spawn(move || {
+            background.run();
+        });
         let rst = {
             let bridge = Bridge::new(&self.prefix);
             let rst = bridge.apply();
@@ -95,8 +101,8 @@ impl Env {
             f(&mut self);
             Ok(())
         };
-        for (_, mut task) in self.commands.drain() {
-            if let Err(err) = task.stop() {
+        for (_, task) in self.tasks.drain() {
+            if let Err(err) = task.lock().unwrap().stop() {
                 tracing::debug!("failed to stop task: {:?}", err);
             }
         }
@@ -130,6 +136,7 @@ pub struct Builder<'a> {
     command: String,
     work_dir: Option<PathBuf>,
     os_env: HashMap<String, String>,
+    shutdown: Option<Shutdown>,
 }
 
 impl<'a> Builder<'a> {
@@ -147,6 +154,7 @@ impl<'a> Builder<'a> {
             command: cmd,
             work_dir: None,
             os_env: HashMap::new(),
+            shutdown: None,
         }
     }
 
@@ -165,6 +173,11 @@ impl<'a> Builder<'a> {
 
     pub fn with_os_env(mut self, key: String, value: String) -> Self {
         self.os_env.insert(key, value);
+        self
+    }
+
+    pub fn with_shutdown(mut self, shutdown: Shutdown) -> Self {
+        self.shutdown = Some(shutdown);
         self
     }
 
@@ -196,7 +209,14 @@ impl<'a> Builder<'a> {
             self.os_env,
         );
         task.start()?;
-        self.env.commands.insert(id.clone(), task);
+        let task = Arc::new(Mutex::new(task));
+        if let Some(shutdown) = self.shutdown {
+            self.env.shutdown_actor.send(ShutdownTask {
+                task: task.clone(),
+                shutdown,
+            });
+        }
+        self.env.tasks.insert(id.clone(), task);
         Ok(())
     }
 }
@@ -212,7 +232,6 @@ pub fn cleanup_veth(prefix: &str) -> Result<usize> {
 pub fn cleanup_namespaces(prefix: &str) -> Result<usize> {
     Namespace::cleanup(prefix)
 }
-
 
 fn random_suffix(n: usize) -> String {
     thread_rng()
@@ -369,8 +388,8 @@ struct ShutdownTask {
     shutdown: Shutdown,
 }
 
-#[derive(Debug)]
-struct Shutdown {
+#[derive(Debug, Clone)]
+pub struct Shutdown {
     interval: Duration,
     interval_jitter: Option<Duration>,
     pause: Option<Duration>,
@@ -439,31 +458,16 @@ impl Shutdown {
     }
 }
 
-struct ShutdownActor {
-    send: Sender<ShutdownTask>,
+struct ActorState {
     recv: Receiver<ShutdownTask>,
     to_pause: MinInstantHeap<ShutdownTask>,
     to_start: MinInstantHeap<ShutdownTask>,
 }
 
-impl ShutdownActor {
-    fn new() -> Self {
-        let (send, recv) = unbounded();
-        Self {
-            send,
-            recv,
-            to_pause: MinInstantHeap::new(),
-            to_start: MinInstantHeap::new(),
-        }
-    }
-
-    fn send(&self, shutdown: ShutdownTask) {
-        self.send.send(shutdown).unwrap();
-    }
-
+impl ActorState {
     fn on_receive(&mut self, stask: ShutdownTask) {
         self.to_pause.push(MinInstantEntry {
-            timestamp: Instant::now() + stask.shutdown.interval,
+            timestamp: now_with_jitter(stask.shutdown.interval, stask.shutdown.interval_jitter),
             task: stask,
         });
     }
@@ -488,7 +492,7 @@ impl ShutdownActor {
             }
             if let Some(pause) = entry.task.shutdown.pause {
                 self.to_start.push(MinInstantEntry {
-                    timestamp: Instant::now() + pause,
+                    timestamp: now_with_jitter(pause, entry.task.shutdown.pause_jitter),
                     task: entry.task,
                 });
             } else {
@@ -496,7 +500,7 @@ impl ShutdownActor {
                     tracing::error!("failed to start task: {:?}", err);
                 }
                 self.to_pause.push(MinInstantEntry {
-                    timestamp: Instant::now() + entry.task.shutdown.interval,
+                    timestamp: now_with_jitter(entry.task.shutdown.interval, entry.task.shutdown.interval_jitter),
                     task: entry.task,
                 });
             }
@@ -514,7 +518,7 @@ impl ShutdownActor {
                 tracing::error!("failed to start task: {:?}", err);
             }
             self.to_pause.push(MinInstantEntry {
-                timestamp: Instant::now() + entry.task.shutdown.interval,
+                timestamp: now_with_jitter(entry.task.shutdown.interval, entry.task.shutdown.interval_jitter),
                 task: entry.task,
             });
         }
@@ -544,4 +548,41 @@ impl ShutdownActor {
             self.start_tasks();
         }
     }
+}
+
+struct ShutdownActor {
+    send: Sender<ShutdownTask>,
+    state: Mutex<ActorState>,
+}
+
+impl ShutdownActor {
+    fn new() -> Self {
+        let (send, recv) = unbounded();
+        Self {
+            send,
+            state: Mutex::new(ActorState {
+                recv,
+                to_pause: MinInstantHeap::new(),
+                to_start: MinInstantHeap::new(),
+            }),
+        }
+    }
+
+    fn send(&self, shutdown: ShutdownTask) {
+        self.send.send(shutdown).unwrap();
+    }
+
+    fn run(&self) {
+        self.state.lock().unwrap().run();
+    }
+}
+
+fn now_with_jitter(duration: Duration, jitter: Option<Duration>) -> Instant {
+    let mut rng = thread_rng();
+    let mut timestamp = Instant::now() + duration;
+    if let Some(jitter) = jitter {
+        let jitter = rng.gen_range(-jitter.as_secs_f64()..jitter.as_secs_f64());
+        timestamp += Duration::from_secs_f64(jitter);
+    };
+    timestamp
 }

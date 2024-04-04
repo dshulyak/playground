@@ -1,7 +1,7 @@
 use anyhow::Result;
 use clap::{error::ErrorKind, Command, CommandFactory, Parser, Subcommand};
 use crossbeam::{channel::unbounded, select};
-use playground::Env;
+use playground::{Env, Shutdown};
 use std::{path::PathBuf, str::FromStr};
 use tracing::metadata::LevelFilter;
 
@@ -76,9 +76,15 @@ cidr is expected to have as many addresses as th sum of all commands instances"
     prefix: String,
     #[clap(
         long = "shutdown",
-        help = "periodically shutdown the command, and restart it after a given delay."
+        help = "periodically shutdown the command, and restart it after a given delay.
+EXAMPLES:
+    --shutdown='interval 10s jitter 5s duration 1m jitter 10s'
+    --shutdown='interval 10s'
+    --shutdown='interval 10s duration 1m'        
+",
+        value_parser = Shutdown::parse
     )]
-    shutdown: Vec<String>,
+    shutdown: Vec<Shutdown>,
     #[clap(
         long = "no-revert",
         help = "do not revert the changes made to the network configuration."
@@ -196,6 +202,7 @@ fn run(mut cmd: Command, opts: &Run) {
             let first_netem = opts.netem.first().map(|n| n.clone());
             let first_count = opts.counts.first().copied().unwrap_or(1);
             let first_work_dir = opts.work_dirs.first().map(|w| w.clone());
+            let first_shutdown = opts.shutdown.first().map(|s| s.clone());
             for (i, cmd) in opts.commands.iter().enumerate() {
                 for _ in 0..opts.counts.get(i).copied().unwrap_or(first_count) {
                     let tbf = opts
@@ -206,9 +213,16 @@ fn run(mut cmd: Command, opts: &Run) {
                         .netem
                         .get(i)
                         .map_or(first_netem.clone(), |n| Some(n.clone()));
+                    let shutdown = opts
+                        .shutdown
+                        .get(i)
+                        .map_or(first_shutdown.clone(), |s| Some(s.clone()));
                     let mut builder = e.add(cmd.clone()).with_qdisc(tbf, netem);
                     if let Some(work_dir) = opts.work_dirs.get(i).or(first_work_dir.as_ref()) {
                         builder = builder.with_work_dir(work_dir.clone());
+                    }
+                    if let Some(shutdown) = shutdown {
+                        builder = builder.with_shutdown(shutdown);
                     }
                     for env in &opts.env {
                         builder = builder.with_os_env(env.0.clone(), env.1.clone());

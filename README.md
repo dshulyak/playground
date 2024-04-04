@@ -20,12 +20,6 @@ play cleanup
 
 
 ## TODO
-- [ ] spawn supervised commands that can be killed or stopped periodically
-    --shutdown 'interval=30m jit=30s pause=20m jit=30s' 
-    every 30 minutes kill process pause for 20 minutes
-    duration is counted since last event timestamp. for example 30 minutes are counted since process was started or restarted.
-    pause is counted since process was stopped.
-    each of this commands accept jitter as second parameter.
 - [ ] partition commands from each other periodically
     --partition 'partition=50% 30% 20% interval=30m duration=10s'
     --partition 'partition=1,2 3 4,5 interval=30m duration=10s'

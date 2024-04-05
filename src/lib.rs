@@ -1,8 +1,9 @@
 use std::collections::HashMap;
+use std::fmt::Display;
 use std::fs::OpenOptions;
 use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::str::FromStr;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -17,8 +18,8 @@ use rand::distributions::Alphanumeric;
 use rand::{thread_rng, Rng};
 
 mod network;
-mod periodic;
 pub mod partition;
+mod periodic;
 
 use crate::network::{Bridge, Namespace, Qdisc, Veth};
 use crate::periodic::{MinInstantEntry, MinInstantHeap};
@@ -94,7 +95,7 @@ impl Env {
         let task = PartitionTask::new(partition, self.veth.values().cloned().collect());
         self.partition = Some(PartitionBackground::spawn(task)?);
         Ok(())
-    }   
+    }
 
     pub fn run(mut self, f: impl FnOnce(&mut Self)) -> Result<()> {
         let background = self.shutdown_actor.clone();
@@ -378,9 +379,12 @@ impl Task {
     }
 
     fn stop(&mut self) -> Result<()> {
-        if let Some(process) = &mut self.process {
-            process.kill()?;
+        if let Some(process) = &mut self.process.take() {
+            process.kill().context("kill process")?;
             match process.wait() {
+                Ok(status) if status.code().is_none() => {
+                    tracing::debug!("command was terminated by signal: {}", status);
+                }
                 Ok(status) => {
                     if !status.success() {
                         anyhow::bail!("command failed with status: {}", status);
@@ -390,8 +394,17 @@ impl Task {
                     anyhow::bail!("failed to wait for command: {:?}", err);
                 }
             }
+            for handler in self.handlers.drain(..) {
+                _ = handler.join();
+            }
         }
         Ok(())
+    }
+}
+
+impl Display for Task {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.ns.name)
     }
 }
 
@@ -399,6 +412,12 @@ impl Task {
 struct ShutdownTask {
     task: Arc<Mutex<Task>>,
     shutdown: Shutdown,
+}
+
+impl Display for ShutdownTask {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} {}", self.task.lock().unwrap(), self.shutdown)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -411,7 +430,9 @@ pub struct Shutdown {
 
 impl Shutdown {
     pub fn parse(input: &str) -> Result<Shutdown> {
-        let mut parts = input.split(' ');
+        tracing::debug!("parsing shutdown: {}", input);
+
+        let mut parts = input.split_whitespace();
         let interval = match parts.next() {
             Some("interval") => {
                 let interval = parts
@@ -422,20 +443,17 @@ impl Shutdown {
             Some(other) => return Err(anyhow::anyhow!("unknown keyword: {}", other)),
             None => return Err(anyhow::anyhow!("interval is required")),
         };
-        let mut token = parts.next();
-        let interval_jitter = match token {
-            Some("jitter") => {
+        let token = parts.next();
+        let interval_jitter = {
+            if let Some("jitter") = token {
                 let interval_jitter = parts
                     .next()
                     .ok_or_else(|| anyhow::anyhow!("interval jitter is required"))?;
                 Some(humantime::parse_duration(interval_jitter)?)
+            } else {
+                None
             }
-            Some(other) => return Err(anyhow::anyhow!("unknown keyword: {}", other)),
-            None => None,
         };
-        if token.is_some() {
-            token = parts.next();
-        }
         let pause = match token {
             Some("pause") => {
                 let pause = parts
@@ -471,6 +489,22 @@ impl Shutdown {
     }
 }
 
+impl Display for Shutdown {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "interval {}", humantime::Duration::from(self.interval))?;
+        if let Some(interval_jitter) = self.interval_jitter {
+            write!(f, " jitter {}", humantime::Duration::from(interval_jitter))?;
+        }
+        if let Some(pause) = self.pause {
+            write!(f, " pause {}", humantime::Duration::from(pause))?;
+            if let Some(pause_jitter) = self.pause_jitter {
+                write!(f, " jitter {}", humantime::Duration::from(pause_jitter))?;
+            }
+        }
+        Ok(())
+    }
+}
+
 struct ActorState {
     recv: Receiver<ShutdownTask>,
     to_pause: MinInstantHeap<ShutdownTask>,
@@ -479,6 +513,7 @@ struct ActorState {
 
 impl ActorState {
     fn on_receive(&mut self, stask: ShutdownTask) {
+        tracing::debug!("received shutdown task: {}", stask,);
         self.to_pause.push(MinInstantEntry {
             timestamp: now_with_jitter(stask.shutdown.interval, stask.shutdown.interval_jitter),
             task: stask,
@@ -486,10 +521,15 @@ impl ActorState {
     }
 
     fn wakeup(&self) -> Option<Duration> {
-        self.to_pause
-            .peek()
-            .map(|entry| entry.timestamp)
-            .min(self.to_start.peek().map(|entry| entry.timestamp))
+        let to_pause = self.to_pause.peek().map(|entry| entry.timestamp);
+        let to_start = self.to_start.peek().map(|entry| entry.timestamp);
+        if let Some(to_pause) = to_pause {
+            if let Some(to_start) = to_start {
+                return Some(to_pause.min(to_start).saturating_duration_since(Instant::now()));
+            }
+        }
+        to_pause
+            .or(to_start)
             .map(|min| min.saturating_duration_since(Instant::now()))
     }
 
@@ -499,9 +539,21 @@ impl ActorState {
             if entry.timestamp > now {
                 break;
             }
+            tracing::debug!("pausing task: {}", entry.task);
             let entry = self.to_pause.pop().unwrap();
-            if let Err(err) = entry.task.task.lock().unwrap().stop() {
+            let err =  {
+                entry.task.task.lock().unwrap().stop()
+            };
+            if let Err(err) = err {
                 tracing::error!("failed to stop task: {:?}", err);
+                self.to_pause.push(MinInstantEntry {
+                    timestamp: now_with_jitter(
+                        entry.task.shutdown.interval,
+                        entry.task.shutdown.interval_jitter,
+                    ),
+                    task: entry.task,
+                });
+                continue;
             }
             if let Some(pause) = entry.task.shutdown.pause {
                 self.to_start.push(MinInstantEntry {
@@ -509,11 +561,15 @@ impl ActorState {
                     task: entry.task,
                 });
             } else {
+                tracing::debug!("restarting task: {}", entry.task);
                 if let Err(err) = entry.task.task.lock().unwrap().start() {
                     tracing::error!("failed to start task: {:?}", err);
                 }
                 self.to_pause.push(MinInstantEntry {
-                    timestamp: now_with_jitter(entry.task.shutdown.interval, entry.task.shutdown.interval_jitter),
+                    timestamp: now_with_jitter(
+                        entry.task.shutdown.interval,
+                        entry.task.shutdown.interval_jitter,
+                    ),
                     task: entry.task,
                 });
             }
@@ -526,12 +582,17 @@ impl ActorState {
             if entry.timestamp > now {
                 break;
             }
-            let entry = self.to_start.pop().unwrap();
+            tracing::debug!("starting task: {}", entry.task);
             if let Err(err) = entry.task.task.lock().unwrap().start() {
                 tracing::error!("failed to start task: {:?}", err);
+                break;
             }
+            let entry = self.to_start.pop().unwrap();
             self.to_pause.push(MinInstantEntry {
-                timestamp: now_with_jitter(entry.task.shutdown.interval, entry.task.shutdown.interval_jitter),
+                timestamp: now_with_jitter(
+                    entry.task.shutdown.interval,
+                    entry.task.shutdown.interval_jitter,
+                ),
                 task: entry.task,
             });
         }
@@ -541,6 +602,7 @@ impl ActorState {
         loop {
             match self.wakeup() {
                 Some(duration) if duration > Duration::from_nanos(0) => {
+                    tracing::debug!("sleeping for {}", humantime::Duration::from(duration));
                     select! {
                         recv(self.recv) -> task => {
                             self.on_receive(task.unwrap());
@@ -550,6 +612,7 @@ impl ActorState {
                 }
                 Some(_) => {}
                 None => {
+                    tracing::debug!("waiting for tasks");
                     select! {
                         recv(self.recv) -> task => {
                             self.on_receive(task.unwrap());

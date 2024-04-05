@@ -20,9 +20,7 @@ play cleanup
 
 
 ## TODO
-- [ ] slow/faulty disk emulation
-    not clear if i will use it.
-- [ ] cgroups v2 for memory and cpu shares
-    not clear if i will use it.
-- [ ] distribute environment.
-    very complicated. likely out of scope
+- [ ] slow/faulty disk emulation ?
+- [ ] cgroups v2 for memory limits and cpu shares ?
+- [ ] distributed environment ?
+  i can do that with primary/agent and vxlan tunnel for network.

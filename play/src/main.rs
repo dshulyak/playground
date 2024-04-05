@@ -1,7 +1,7 @@
 use anyhow::Result;
 use clap::{error::ErrorKind, Command, CommandFactory, Parser, Subcommand};
 use crossbeam::{channel::unbounded, select};
-use playground::{Env, Shutdown};
+use playground::{partition::Partition, Env, Shutdown};
 use std::{path::PathBuf, str::FromStr};
 use tracing::metadata::LevelFilter;
 
@@ -85,6 +85,19 @@ EXAMPLES:
         value_parser = Shutdown::parse
     )]
     shutdown: Vec<Shutdown>,
+    #[clap(
+        long = "partition",
+        help = "partition the network into several buckets.
+first set of values are the buckets that must add up to 1.0.
+interval defines how often partition is triggered, and the duration is for how long.
+EXAMPLES:
+    --partition='0.5 0.5 interval 5s duration 10s'
+in the example above network is partitioned into two equal halves every 5s after it was restored.
+it remains in the partitioned state for 10s and then gets restored.  
+",
+        value_parser = Partition::parse,
+    )]
+    partition: Option<Partition>,
     #[clap(
         long = "no-revert",
         help = "do not revert the changes made to the network configuration."
@@ -231,6 +244,12 @@ fn run(mut cmd: Command, opts: &Run) {
                         tracing::error!("failed to run command: {:?}", err);
                         return;
                     };
+                }
+            }
+            if let Some(partition) = &opts.partition {
+                if let Err(err) = e.enable_partition(partition.clone()) {
+                    tracing::error!("failed to spinup partition agent network: {:?}", err);
+                    return;
                 }
             }
             select! {

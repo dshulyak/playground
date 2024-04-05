@@ -20,10 +20,6 @@ play cleanup
 
 
 ## TODO
-- [ ] partition commands from each other periodically
-    --partition 'partition=50% 30% 20% interval=30m duration=10s'
-    --partition 'partition=1,2 3 4,5 interval=30m duration=10s'
-    can do it with nft by dropping traffic on the bridge that is from src => dst and dst => src
 - [ ] slow/faulty disk emulation
     not clear if i will use it.
 - [ ] cgroups v2 for memory and cpu shares

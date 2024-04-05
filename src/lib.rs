@@ -12,11 +12,13 @@ use anyhow::{Context, Result};
 use crossbeam::channel::{unbounded, Receiver, Sender};
 use crossbeam::select;
 use ipnet::{IpAddrRange, IpNet};
+use partition::{PartitionBackground, PartitionTask};
 use rand::distributions::Alphanumeric;
 use rand::{thread_rng, Rng};
 
 mod network;
 mod periodic;
+pub mod partition;
 
 use crate::network::{Bridge, Namespace, Qdisc, Veth};
 use crate::periodic::{MinInstantEntry, MinInstantHeap};
@@ -36,6 +38,7 @@ pub struct Env {
     // redirect stdout and stderr to files in the working directories
     redirect: bool,
     shutdown_actor: Arc<ShutdownActor>,
+    partition: Option<PartitionBackground>,
 }
 
 impl Env {
@@ -55,6 +58,7 @@ impl Env {
             revert: true,
             redirect: false,
             shutdown_actor: Arc::new(ShutdownActor::new()),
+            partition: None,
         }
     }
 
@@ -86,6 +90,12 @@ impl Env {
         &self.errors_receiver
     }
 
+    pub fn enable_partition(&mut self, partition: partition::Partition) -> Result<()> {
+        let task = PartitionTask::new(partition, self.veth.values().cloned().collect());
+        self.partition = Some(PartitionBackground::spawn(task)?);
+        Ok(())
+    }   
+
     pub fn run(mut self, f: impl FnOnce(&mut Self)) -> Result<()> {
         let background = self.shutdown_actor.clone();
         thread::spawn(move || {
@@ -105,6 +115,9 @@ impl Env {
             if let Err(err) = task.lock().unwrap().stop() {
                 tracing::debug!("failed to stop task: {:?}", err);
             }
+        }
+        if let Some(partition) = self.partition.take() {
+            partition.stop();
         }
         if self.revert {
             for (_, veth) in self.veth.drain() {

@@ -6,7 +6,7 @@ use anyhow::{Context, Result};
 use serde_json::Value;
 
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Hash, PartialEq, Eq)]
 pub(crate) struct Namespace {
     pub(crate) name: String,
 }
@@ -101,6 +101,14 @@ impl Veth {
             bridge,
             namespace,
         }
+    }
+
+    pub(crate) fn ns(&self) -> &Namespace {
+        &self.namespace
+    }
+
+    pub(crate) fn ip_addr(&self) -> IpAddr {
+        self.addr
     }
 
     fn addr(&self) -> String {
@@ -247,4 +255,34 @@ fn shell(cmd: &str) -> Result<Vec<u8>> {
     }
 
     Ok(output.stdout)
+}
+
+#[derive(Debug, Clone, Hash, PartialEq, Eq)]
+pub(crate) struct Drop {
+    ns: Namespace,
+    addr: IpAddr,
+}
+
+impl Drop {
+    pub(crate) fn new(ns: Namespace, addr: IpAddr) -> Self {
+        Drop { ns, addr }
+    }
+
+    pub(crate) fn apply(&self) -> Result<()> {
+        shell(&format!(
+            "ip netns exec {} iptables -A INPUT -s {} -j DROP",
+            self.ns.name,
+            self.addr
+        ))?;
+        Ok(())
+    }
+
+    pub(crate) fn revert(&self) -> Result<()> {
+        shell(&format!(
+            "ip netns exec {} iptables -D INPUT -s {} -j DROP",
+            self.ns.name,
+            self.addr
+        ))?;
+        Ok(())
+    }
 }

@@ -19,6 +19,12 @@ play cleanup
 ### Library
 
 
+### Workaround for docker breaking other bridges
+
+> sysctl -w net.bridge.bridge-nf-call-iptables=0
+
+More details in https://serverfault.com/questions/963759/docker-breaks-libvirt-bridge-network
+
 ## TODO
 - [ ] slow/faulty disk emulation ?
 - [ ] cgroups v2 for memory limits and cpu shares ?

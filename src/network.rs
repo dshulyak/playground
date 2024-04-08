@@ -49,12 +49,14 @@ impl Namespace {
 #[derive(Debug, Clone)]
 pub(crate) struct Bridge {
     name: String,
+    addr: IpAddr,
 }
 
 impl Bridge {
-    pub(crate) fn new(ns: &str) -> Self {
+    pub(crate) fn new(ns: &str, ip: IpAddr) -> Self {
         Bridge {
             name: format!("{}-br", ns),
+            addr: ip,
         }
     }
 
@@ -78,6 +80,7 @@ impl Bridge {
     pub(crate) fn apply(&self) -> Result<()> {
         shell(&format!("ip link add {} type bridge", self.name))?;
         shell(&format!("ip link set {} up", self.name))?;
+        shell(&format!("ip addr add {} dev {}", addr_to_string(self.addr), self.name))?;
         Ok(())
     }
 
@@ -109,13 +112,6 @@ impl Veth {
 
     pub(crate) fn ip_addr(&self) -> IpAddr {
         self.addr
-    }
-
-    fn addr(&self) -> String {
-        match self.addr {
-            IpAddr::V4(addr) => format!("{}/24", addr),
-            IpAddr::V6(addr) => format!("{}/64", addr),
-        }
     }
 
     fn guest(&self) -> String {
@@ -161,7 +157,7 @@ impl Veth {
         shell(&format!(
             "ip -n {} addr add {} dev {}",
             self.namespace.name,
-            self.addr(),
+            addr_to_string(self.addr),
             self.guest()
         ))?;
         shell(&format!(
@@ -284,5 +280,12 @@ impl Drop {
             self.addr
         ))?;
         Ok(())
+    }
+}
+
+fn addr_to_string(addr: IpAddr) -> String {
+    match addr {
+        IpAddr::V4(addr) => format!("{}/24", addr),
+        IpAddr::V6(addr) => format!("{}/64", addr),
     }
 }

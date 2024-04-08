@@ -103,7 +103,11 @@ impl Env {
             background.run();
         });
         let rst = {
-            let bridge = Bridge::new(&self.prefix);
+            let ip = self
+                .hosts
+                .next()
+                .ok_or_else(|| anyhow::anyhow!("no ip address for bridge"))?;
+            let bridge = Bridge::new(&self.prefix, ip);
             let rst = bridge.apply();
             self.bridge = Some(bridge);
             if rst.is_err() {
@@ -525,7 +529,11 @@ impl ActorState {
         let to_start = self.to_start.peek().map(|entry| entry.timestamp);
         if let Some(to_pause) = to_pause {
             if let Some(to_start) = to_start {
-                return Some(to_pause.min(to_start).saturating_duration_since(Instant::now()));
+                return Some(
+                    to_pause
+                        .min(to_start)
+                        .saturating_duration_since(Instant::now()),
+                );
             }
         }
         to_pause
@@ -541,9 +549,7 @@ impl ActorState {
             }
             tracing::debug!("pausing task: {}", entry.task);
             let entry = self.to_pause.pop().unwrap();
-            let err =  {
-                entry.task.task.lock().unwrap().stop()
-            };
+            let err = { entry.task.task.lock().unwrap().stop() };
             if let Err(err) = err {
                 tracing::error!("failed to stop task: {:?}", err);
                 self.to_pause.push(MinInstantEntry {

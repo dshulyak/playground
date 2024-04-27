@@ -226,24 +226,31 @@ fn run(mut cmd: Command, opts: &Run) {
                         .netem
                         .get(i)
                         .map_or(first_netem.clone(), |n| Some(n.clone()));
-                    let shutdown = opts
-                        .shutdown
-                        .get(i)
-                        .map_or(first_shutdown.clone(), |s| Some(s.clone()));
+                    
                     let mut builder = e.add(cmd.clone()).with_qdisc(tbf, netem);
                     if let Some(work_dir) = opts.work_dirs.get(i).or(first_work_dir.as_ref()) {
                         builder = builder.with_work_dir(work_dir.clone());
                     }
-                    if let Some(shutdown) = shutdown {
-                        builder = builder.with_shutdown(shutdown);
-                    }
                     for env in &opts.env {
                         builder = builder.with_os_env(env.0.clone(), env.1.clone());
                     }
-                    if let Err(err) = builder.spawn() {
-                        tracing::error!("failed to run command: {:?}", err);
-                        return;
+                    let id = match builder.spawn() {
+                        Ok(id) => id,
+                        Err(err) => {
+                            tracing::error!("failed to run command: {:?}", err);
+                            return;
+                        }
                     };
+                    let shutdown = opts
+                        .shutdown
+                        .get(i)
+                        .map_or(first_shutdown.clone(), |s| Some(s.clone()));
+                    if let Some(shutdown) = shutdown {
+                        if let Err(err) = e.enable_shutdown(&id, shutdown) {
+                            tracing::error!("failed to enable shutdown task for id {:?}: {:?}", id, err);
+                            return;
+                        }
+                    }
                 }
             }
             if let Some(partition) = &opts.partition {

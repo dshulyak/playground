@@ -97,6 +97,14 @@ impl Env {
         Ok(())
     }
 
+    pub fn enable_shutdown(&mut self, id: &String, shutdown: Shutdown) -> Result<()> {
+        self.shutdown_actor.send(ShutdownTask {
+            task: self.tasks.get(id).unwrap().clone(),
+            shutdown,
+        });
+        Ok(())
+    }
+
     pub fn run(mut self, f: impl FnOnce(&mut Self)) -> Result<()> {
         let background = self.shutdown_actor.clone();
         thread::spawn(move || {
@@ -154,7 +162,6 @@ pub struct Builder<'a> {
     command: String,
     work_dir: Option<PathBuf>,
     os_env: HashMap<String, String>,
-    shutdown: Option<Shutdown>,
 }
 
 impl<'a> Builder<'a> {
@@ -172,7 +179,6 @@ impl<'a> Builder<'a> {
             command: cmd,
             work_dir: None,
             os_env: HashMap::new(),
-            shutdown: None,
         }
     }
 
@@ -194,12 +200,7 @@ impl<'a> Builder<'a> {
         self
     }
 
-    pub fn with_shutdown(mut self, shutdown: Shutdown) -> Self {
-        self.shutdown = Some(shutdown);
-        self
-    }
-
-    pub fn spawn(self) -> anyhow::Result<()> {
+    pub fn spawn(self) -> anyhow::Result<String> {
         let sender = match &self.env.errors_sender {
             Some(sender) => sender.clone(),
             None => anyhow::bail!("can't spawn new tasks after the environment has been run"),
@@ -227,15 +228,8 @@ impl<'a> Builder<'a> {
             self.os_env,
         );
         task.start()?;
-        let task = Arc::new(Mutex::new(task));
-        if let Some(shutdown) = self.shutdown {
-            self.env.shutdown_actor.send(ShutdownTask {
-                task: task.clone(),
-                shutdown,
-            });
-        }
-        self.env.tasks.insert(id.clone(), task);
-        Ok(())
+        self.env.tasks.insert(id.clone(), Arc::new(Mutex::new(task)));
+        Ok(id)
     }
 }
 

@@ -9,7 +9,7 @@ export PATH=$PATH:./target/debug/
 ```
 
 ```bash
-play run -c "ping 10.0.0.1" -c "ping 10.0.0.2" --netem='delay 10ms'
+play run -c "ping 10.0.0.3" -c "ping 10.0.0.2" --netem='delay 10ms'
 ```
 
 ```bash
@@ -19,14 +19,15 @@ play cleanup
 ### Library
 
 
-### Workaround for docker breaking other bridges
+### Knowns workarounds
 
-> sysctl -w net.bridge.bridge-nf-call-iptables=0
+- arp cache threshing, can be diagnosed by looking at dmesg
+```
+sudo sysctl -w net.ipv4.neigh.default.gc_thresh3=204800
+```
+- docker interfering with other bridges
+```
+sudo sysctl -w net.bridge.bridge-nf-call-iptables=0
+```
 
 More details in https://serverfault.com/questions/963759/docker-breaks-libvirt-bridge-network
-
-## TODO
-- [ ] slow/faulty disk emulation ?
-- [ ] cgroups v2 for memory limits and cpu shares ?
-- [ ] distributed environment ?
-  i can do that with primary/agent and vxlan tunnel for network.

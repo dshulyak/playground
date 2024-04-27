@@ -215,19 +215,6 @@ impl Qdisc {
         }
         Ok(())
     }
-
-    pub(crate) fn revert(&self) -> Result<()> {
-        if self.netem.is_some() || self.tbf.is_some() {
-            if let Err(err) = shell(&format!(
-                "ip netns exec {} tc qdisc del dev {} root",
-                self.veth.namespace.name,
-                self.veth.guest()
-            )) {
-                return Result::Err(err);
-            }
-        }
-        Ok(())
-    }
 }
 
 fn shell(cmd: &str) -> Result<Vec<u8>> {

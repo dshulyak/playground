@@ -239,10 +239,12 @@ fn run(mut cmd: Command, opts: &Run) {
                     };
                 }
             }
+            let since = std::time::Instant::now();
             if let Err(err) = e.deploy() {
                 tracing::error!("failed to deploy playground: {:?}", err);
                 return;
             }
+            tracing::info!("playground deployed in {:?}", since.elapsed());
             if let Some(partition) = &opts.partition {
                 if let Err(err) = e.enable_partition(partition.clone()) {
                     tracing::error!("failed to spinup partition agent network: {:?}", err);

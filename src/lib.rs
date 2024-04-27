@@ -4,7 +4,7 @@ use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::str::FromStr;
-use std::{env, thread};
+use std::{env, thread, vec};
 
 use anyhow::{Context, Result};
 use crossbeam::channel::{unbounded, Receiver, Sender};
@@ -131,24 +131,32 @@ impl Env {
         let state = &mut data.state;
         let tasks = &mut data.tasks;
 
+        let since = std::time::Instant::now();
+        let zipped = state.values_mut().zip(network.values());
+        for (state, network) in zipped {
+            if let State::Pending = state {
+                deploy(network)?;
+                *state = State::Deployed;
+            }
+        }
+        tracing::info!("deployed in {:?}", since.elapsed());
+
+        let since = std::time::Instant::now();
         let zipped = state
             .iter_mut()
             .zip(network.values())
             .zip(commands.values());
         for (((index, state), network), command) in zipped {
-            if let State::Pending = state {
-                deploy(network)?;
-                *state = State::Deployed;
-                let task = run(
-                    *index,
-                    network,
-                    command,
-                    &self.errors_sender.as_ref().unwrap(),
-                )?;
-                tasks.insert(*index, task);
-                *state = State::Running;
-            }
+            let task = run(
+                *index,
+                network,
+                command,
+                &self.errors_sender.as_ref().unwrap(),
+            )?;
+            tasks.insert(*index, task);
+            *state = State::Running;
         }
+        tracing::info!("commands started in {:?}", since.elapsed());
         Ok(())
     }
 
@@ -175,7 +183,6 @@ impl Env {
             }
         }
         tasks.clear();
-
 
         if let Some(partition) = self.partition.take() {
             partition.stop();

@@ -126,9 +126,10 @@ impl Veth {
         let output = shell("ip -json link show type veth")?;
         let veths: Vec<HashMap<String, Value>> = serde_json::from_slice(&output)?;
         let mut count = 0;
+        let prefix = format!("veth-{}", prefix);
         for veth in veths {
             match &veth["ifname"] {
-                Value::String(ifname) if ifname.starts_with(prefix) => {
+                Value::String(ifname) if ifname.starts_with(prefix.as_str()) => {
                     shell(&format!("ip link del {}", ifname))?;
                     count += 1;
                 }

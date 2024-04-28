@@ -1,6 +1,9 @@
 use anyhow::Result;
 use clap::{error::ErrorKind, Command, CommandFactory, Parser, Subcommand};
-use crossbeam::{channel::unbounded, select};
+use crossbeam::{
+    channel::{unbounded, Receiver},
+    select,
+};
 use playground::{partition::Partition, Config};
 use std::{path::PathBuf, str::FromStr};
 use tracing::metadata::LevelFilter;
@@ -103,6 +106,11 @@ it remains in the partitioned state for 10s and then gets restored.
         help = "redirect stdout and stderr to work_dir/namespace.{stdout, stderr} files."
     )]
     redirect: bool,
+    #[clap(
+        long = "instances-per-bridge",
+        help = "number of instances per bridge."
+    )]
+    instances_per_bridge: Option<usize>,
 }
 
 impl Run {
@@ -193,76 +201,81 @@ fn run(mut cmd: Command, opts: &Run) {
         .exit();
     }
 
-    if let Err(err) = {
-        let cfg = Config::new()
-            .with_network(opts.cidr.clone())
-            .with_prefix(opts.unique_name())
-            .with_revert(!opts.no_revert)
-            .with_redirect(opts.redirect);
-        cfg.run(|e| {
-            let first_tbf = opts.tbf.first().map(|t| t.clone());
-            let first_netem = opts.netem.first().map(|n| n.clone());
-            let first_count = opts.counts.first().copied().unwrap_or(1);
-            let first_work_dir = opts.work_dirs.first().map(|w| w.clone());
-            for (i, cmd) in opts.commands.iter().enumerate() {
-                for _ in 0..opts.counts.get(i).copied().unwrap_or(first_count) {
-                    let tbf = opts
-                        .tbf
-                        .get(i)
-                        .map_or(first_tbf.clone(), |t| Some(t.clone()));
-                    let netem = opts
-                        .netem
-                        .get(i)
-                        .map_or(first_netem.clone(), |n| Some(n.clone()));
-
-                    let work_dir = opts
-                        .work_dirs
-                        .get(i)
-                        .or(first_work_dir.as_ref())
-                        .map(|w| w.clone());
-
-                    let _ = match e.add_task(
-                        cmd.clone(),
-                        work_dir.clone(),
-                        tbf,
-                        netem,
-                        opts.env
-                            .iter()
-                            .map(|e| (e.0.clone(), e.1.clone()))
-                            .collect(),
-                    ) {
-                        Ok(id) => id,
-                        Err(err) => {
-                            tracing::error!("failed to run command: {:?}", err);
-                            return;
-                        }
-                    };
-                }
-            }
-            let since = std::time::Instant::now();
-            if let Err(err) = e.deploy() {
-                tracing::error!("failed to deploy playground: {:?}", err);
-                return;
-            }
-            tracing::info!("playground deployed in {:?}", since.elapsed());
-            if let Some(partition) = &opts.partition {
-                if let Err(err) = e.enable_partition(partition.clone()) {
-                    tracing::error!("failed to spinup partition agent network: {:?}", err);
-                    return;
-                }
-            }
-            select! {
-                recv(tx) -> _ => {
-                    tracing::debug!("received interrupt on the channel");
-                }
-                recv(e.errors()) -> err => {
-                    tracing::error!("error in playground: {:?}", err);
-                }
-            }
-        })
-    } {
+    if let Err(err) = run_error(opts, tx) {
         cmd.error(ErrorKind::Io, format!("{:?}", err)).exit();
     }
+}
+
+fn run_error(opts: &Run, tx: Receiver<()>) -> Result<()> {
+    let mut cfg = Config::new()
+        .with_network(opts.cidr)
+        .with_prefix(opts.unique_name())
+        .with_revert(!opts.no_revert)
+        .with_redirect(opts.redirect);
+    if let Some(instances_per_bridge) = opts.instances_per_bridge {
+        cfg = cfg.with_instances_per_bridge(instances_per_bridge)?;
+    }
+    cfg.run(|e| {
+        let first_tbf = opts.tbf.first().map(|t| t.clone());
+        let first_netem = opts.netem.first().map(|n| n.clone());
+        let first_count = opts.counts.first().copied().unwrap_or(1);
+        let first_work_dir = opts.work_dirs.first().map(|w| w.clone());
+        for (i, cmd) in opts.commands.iter().enumerate() {
+            for _ in 0..opts.counts.get(i).copied().unwrap_or(first_count) {
+                let tbf = opts
+                    .tbf
+                    .get(i)
+                    .map_or(first_tbf.clone(), |t| Some(t.clone()));
+                let netem = opts
+                    .netem
+                    .get(i)
+                    .map_or(first_netem.clone(), |n| Some(n.clone()));
+
+                let work_dir = opts
+                    .work_dirs
+                    .get(i)
+                    .or(first_work_dir.as_ref())
+                    .map(|w| w.clone());
+
+                let _ = match e.add(
+                    cmd.clone(),
+                    work_dir.clone(),
+                    tbf,
+                    netem,
+                    opts.env
+                        .iter()
+                        .map(|e| (e.0.clone(), e.1.clone()))
+                        .collect(),
+                ) {
+                    Ok(id) => id,
+                    Err(err) => {
+                        tracing::error!("failed to run command: {:?}", err);
+                        return;
+                    }
+                };
+            }
+        }
+        let since = std::time::Instant::now();
+        if let Err(err) = e.deploy() {
+            tracing::error!("failed to deploy playground: {:?}", err);
+            return;
+        }
+        tracing::info!("playground deployed in {:?}", since.elapsed());
+        if let Some(partition) = &opts.partition {
+            if let Err(err) = e.enable_partition(partition.clone()) {
+                tracing::error!("failed to spinup partition agent network: {:?}", err);
+                return;
+            }
+        }
+        select! {
+            recv(tx) -> _ => {
+                tracing::debug!("received interrupt on the channel");
+            }
+            recv(e.errors()) -> err => {
+                tracing::error!("error in playground: {:?}", err);
+            }
+        }
+    })
 }
 
 fn cleanup(mut cmd: Command, opts: &Cleanup) {

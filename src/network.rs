@@ -15,39 +15,41 @@ impl Namespace {
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) struct Bridge {
+    pub(crate) index: usize,
     pub(crate) name: String,
     pub(crate) addr: IpAddr,
 }
 
 impl Bridge {
-    pub(crate) fn new(prefix: &str, ip: IpAddr) -> Self {
+    pub(crate) fn new(index: usize, prefix: &str, ip: IpAddr) -> Self {
         Bridge {
-            name: format!("{}-br", prefix),
+            index: index,
+            name: format!("{}-b-{}", prefix, index),
             addr: ip,
         }
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub(crate) struct Veth {
+pub(crate) struct NamespaceVeth {
     pub(crate) addr: IpAddr,
     pub(crate) namespace: Namespace,
 }
 
-impl Veth {
+impl NamespaceVeth {
     pub(crate) fn new(addr: IpAddr, namespace: Namespace) -> Self {
-        Veth {
+        NamespaceVeth {
             addr,
             namespace,
         }
     }
 
     pub(crate) fn guest(&self) -> String {
-        format!("veth-{}-ns", self.namespace.name)
+        format!("v-{}-ns", self.namespace.name)
     }
 
     pub(crate) fn host(&self) -> String {
-        format!("veth-{}-br", self.namespace.name)
+        format!("v-{}-br", self.namespace.name)
     }
 }
 

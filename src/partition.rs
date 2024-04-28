@@ -46,14 +46,14 @@ impl Partition {
     }
 }
 
-pub(crate) struct PartitionTask {
+pub(crate) struct Task {
     partition: Partition,
-    instances: Vec<network::Veth>,
-    enabled: HashSet<(network::Veth, network::Veth)>,
+    instances: Vec<network::NamespaceVeth>,
+    enabled: HashSet<(network::NamespaceVeth, network::NamespaceVeth)>,
 }
 
-impl PartitionTask {
-    pub(crate) fn new(partition: Partition, instances: Vec<network::Veth>) -> Self {
+impl Task {
+    pub(crate) fn new(partition: Partition, instances: Vec<network::NamespaceVeth>) -> Self {
         Self {
             partition,
             instances,
@@ -63,7 +63,7 @@ impl PartitionTask {
 
     pub(crate) fn apply(&mut self) -> Result<()> {
         let len = self.instances.len();
-        let mut buckets: Vec<Vec<network::Veth>> = vec![];
+        let mut buckets: Vec<Vec<network::NamespaceVeth>> = vec![];
         let mut instances = self.instances.iter();
         for bucket in self.partition.buckets.iter() {
             buckets.push(
@@ -98,13 +98,13 @@ impl PartitionTask {
     }
 }
 
-pub(crate) struct PartitionBackground {
+pub(crate) struct Background {
     sender: Sender<()>,
     handler: JoinHandle<()>,
 }
 
-impl PartitionBackground {
-    pub(crate) fn spawn(mut task: PartitionTask) -> Result<Self> {
+impl Background {
+    pub(crate) fn spawn(mut task: Task) -> Result<Self> {
         let (sender, receiver) = crossbeam::channel::unbounded();
         let handle = spawn(move || loop {
             select! {

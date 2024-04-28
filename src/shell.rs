@@ -39,7 +39,7 @@ fn addr_to_string(addr: IpAddr) -> String {
     }
 }
 
-pub(crate) fn veth_apply(veth: &network::Veth, master: &network::Bridge) -> Result<()> {
+pub(crate) fn veth_apply(veth: &network::NamespaceVeth, master: &network::Bridge) -> Result<()> {
     execute(&format!(
         "ip link add {} type veth peer name {}",
         veth.guest(),
@@ -70,7 +70,7 @@ pub(crate) fn veth_apply(veth: &network::Veth, master: &network::Bridge) -> Resu
     Ok(())
 }
 
-pub(crate) fn veth_revert(veth: &network::Veth) -> Result<()> {
+pub(crate) fn veth_revert(veth: &network::NamespaceVeth) -> Result<()> {
     execute(&format!(
         "ip -n {} link del {}",
         veth.namespace.name,
@@ -79,7 +79,7 @@ pub(crate) fn veth_revert(veth: &network::Veth) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn qdisc_apply(veth: &network::Veth, qdisc: &network::Qdisc) -> Result<()> {
+pub(crate) fn qdisc_apply(veth: &network::NamespaceVeth, qdisc: &network::Qdisc) -> Result<()> {
     if let Some(tbf) = &qdisc.tbf {
         execute(&format!(
             "ip netns exec {} tc qdisc add dev {} root handle 1: tbf {}",
@@ -183,7 +183,10 @@ pub fn veth_cleanup(prefix: &str) -> Result<usize> {
     Ok(count)
 }
 
-pub(crate) fn drop_packets_apply(from: &network::Veth, to: &network::Veth) -> Result<()> {
+pub(crate) fn drop_packets_apply(
+    from: &network::NamespaceVeth,
+    to: &network::NamespaceVeth,
+) -> Result<()> {
     execute(&format!(
         "ip netns exec {} iptables -I INPUT -s {} -j DROP",
         from.namespace.name, to.addr
@@ -191,10 +194,52 @@ pub(crate) fn drop_packets_apply(from: &network::Veth, to: &network::Veth) -> Re
     Ok(())
 }
 
-pub(crate) fn drop_packets_revert(from: &network::Veth, to: &network::Veth) -> Result<()> {
+pub(crate) fn drop_packets_revert(
+    from: &network::NamespaceVeth,
+    to: &network::NamespaceVeth,
+) -> Result<()> {
     execute(&format!(
         "ip netns exec {} iptables -D INPUT -s {} -j DROP",
         from.namespace.name, to.addr
     ))?;
+    Ok(())
+}
+
+fn veth_connect_pair(
+    prefix: &str,
+    first: &network::Bridge,
+    second: &network::Bridge,
+) -> (String, String) {
+    (
+        format!("v-{}-c{}{}-0", prefix, first.index, second.index),
+        format!("v-{}-c{}{}-1", prefix, first.index, second.index),
+    )
+}
+
+pub(crate) fn bridge_connnect(
+    prefix: &str,
+    first: &network::Bridge,
+    second: &network::Bridge,
+) -> Result<()> {
+    let (pair0, pair1) = veth_connect_pair(prefix, first, second);
+    execute(&format!(
+        "ip link add name {} type veth peer name {}",
+        pair0, pair1,
+    ))?;
+    execute(&format!("ip link set {} master {}", pair0, first.name))?;
+    execute(&format!("ip link set {} master {}", pair1, second.name))?;
+    execute(&format!("ip link set {} up", pair0))?;
+    execute(&format!("ip link set {} up", pair1))?;
+    Ok(())
+}
+
+pub(crate) fn bridge_disconnect(
+    prefix: &str,
+    first: &network::Bridge,
+    second: &network::Bridge,
+) -> Result<()> {
+    let (pair0, pair1) = veth_connect_pair(prefix, first, second);
+    execute(&format!("ip link del {}", pair0))?;
+    execute(&format!("ip link del {}", pair1))?;
     Ok(())
 }

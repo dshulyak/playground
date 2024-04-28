@@ -6,10 +6,9 @@ use std::process::{Child, Command, Stdio};
 use std::str::FromStr;
 use std::{env, thread, vec};
 
-use anyhow::{Context, Result};
+use anyhow::{ensure, Context, Result};
 use crossbeam::channel::{unbounded, Receiver, Sender};
 use ipnet::{IpAddrRange, IpNet};
-use partition::{PartitionBackground, PartitionTask};
 use rand::distributions::Alphanumeric;
 use rand::{thread_rng, Rng};
 
@@ -17,11 +16,18 @@ mod network;
 pub mod partition;
 pub mod shell;
 
-use crate::network::{Bridge, Namespace, Qdisc, Veth};
+use crate::network::{Bridge, Namespace, NamespaceVeth, Qdisc};
+
+// the primary limitation is the limit of ports enforced in the kernel (the limit is 1<<10)
+// https://github.com/torvalds/linux/blob/80e62bc8487b049696e67ad133c503bf7f6806f7/net/bridge/br_private.h#L28
+// https://github.com/moby/moby/issues/44973#issuecomment-1543733757
+// the veth is 0 based
+const MAX_VETH_PER_BRIDGE: usize = 1023;
 
 pub struct Config {
     prefix: String,
     net: IpNet,
+    instances_per_bridge: usize,
     revert: bool,
     // redirect stdout and stderr to files in the working directories
     redirect: bool,
@@ -32,9 +38,25 @@ impl Config {
         Config {
             prefix: format!("p-{}", random_suffix(4)),
             net: IpNet::from_str("10.0.0.0/16").unwrap(),
+
+            instances_per_bridge: MAX_VETH_PER_BRIDGE,
             revert: true,
             redirect: false,
         }
+    }
+
+    pub fn with_instances_per_bridge(mut self, instances_per_bridge: usize) -> Result<Self> {
+        ensure!(
+            instances_per_bridge > 0,
+            "instances_per_bridge must be greater than 0"
+        );
+        ensure!(
+            instances_per_bridge <= MAX_VETH_PER_BRIDGE,
+            "instances_per_bridge must be less than or equal to {}",
+            MAX_VETH_PER_BRIDGE
+        );
+        self.instances_per_bridge = instances_per_bridge.min(MAX_VETH_PER_BRIDGE);
+        Ok(self)
     }
 
     pub fn with_prefix(mut self, prefix: String) -> Self {
@@ -57,7 +79,7 @@ impl Config {
         self
     }
 
-    pub fn run(self, f: impl FnOnce(&mut Env)) -> Result<()> {
+    pub fn run(self, f: impl FnOnce(&mut Env)) -> anyhow::Result<()> {
         let env = Env::new(self);
         env.run(f)
     }
@@ -67,25 +89,26 @@ pub struct Env {
     cfg: Config,
     hosts: IpAddrRange,
     next: usize,
-    data: EnvData,
-    bridge: Bridge,
-    errors_sender: Option<Sender<anyhow::Result<()>>>,
+    instances: Instances,
+    bridges: BTreeMap<usize, (Bridge, State)>,
+    connects: BTreeMap<(usize, usize), State>,
+    errors_sender: Sender<anyhow::Result<()>>,
     errors_receiver: Receiver<anyhow::Result<()>>,
-    partition: Option<PartitionBackground>,
+    partition: Option<partition::Background>,
 }
 
 impl Env {
     fn new(cfg: Config) -> Self {
         let (sender, receiver) = unbounded();
-        let mut hosts = cfg.net.hosts();
-        let bridge = Bridge::new(&cfg.prefix, hosts.next().expect("empty hosts range"));
+        let hosts = cfg.net.hosts();
         Env {
             cfg: cfg,
             hosts: hosts,
             next: 0,
-            bridge: bridge,
-            data: EnvData::new(),
-            errors_sender: Some(sender),
+            bridges: BTreeMap::new(),
+            connects: BTreeMap::new(),
+            instances: Instances::new(),
+            errors_sender: sender,
             errors_receiver: receiver,
             partition: None,
         }
@@ -97,17 +120,17 @@ impl Env {
 
     pub fn enable_partition(&mut self, partition: partition::Partition) -> Result<()> {
         let veths = self
-            .data
+            .instances
             .network
             .values()
             .map(|network| network.veth.clone())
             .collect();
-        let task = PartitionTask::new(partition, veths);
-        self.partition = Some(PartitionBackground::spawn(task)?);
+        let task = partition::Task::new(partition, veths);
+        self.partition = Some(partition::Background::spawn(task)?);
         Ok(())
     }
 
-    pub fn add_task(
+    pub fn add(
         &mut self,
         cmd: String,
         work_dir: Option<PathBuf>,
@@ -117,12 +140,25 @@ impl Env {
     ) -> anyhow::Result<usize> {
         let index = self.next;
         self.next += 1;
+        let bridge_index = index / self.cfg.instances_per_bridge;
+        if !self.bridges.contains_key(&bridge_index) {
+            let ip = self
+                .hosts
+                .next()
+                .ok_or_else(|| anyhow::anyhow!("run out of ip addresses"))?;
+            let bridge = Bridge::new(bridge_index, &self.cfg.prefix, ip);
+            self.bridges.insert(bridge_index, (bridge, State::Pending));
+            for i in 0..bridge_index {
+                self.connects.insert((i, bridge_index), State::Pending);
+            }
+        }
+
         let ip = self
             .hosts
             .next()
             .ok_or_else(|| anyhow::anyhow!("run out of ip addresses"))?;
         let ns = Namespace::new(&self.cfg.prefix, index);
-        let veth = Veth::new(ip, ns.clone());
+        let veth = NamespaceVeth::new(ip, ns.clone());
         let current_dir = env::current_dir().context("failed to get current directory")?;
         let work_dir: &PathBuf = work_dir.as_ref().unwrap_or_else(|| &current_dir);
 
@@ -141,12 +177,29 @@ impl Env {
             os_env,
             redirect: self.cfg.redirect,
         };
-        self.data.add(index, network, command);
+        self.instances.add(index, network, command);
         Ok(index)
     }
 
     pub fn deploy(&mut self) -> anyhow::Result<()> {
-        let data = &mut self.data;
+        for (bridge, state) in self.bridges.values_mut() {
+            if let State::Pending = state {
+                shell::bridge_apply(bridge)?;
+                *state = State::Deployed;
+            }
+        }
+        for ((from, to), state) in self.connects.iter_mut() {
+            if let State::Pending = state {
+                shell::bridge_connnect(
+                    &self.cfg.prefix,
+                    &self.bridges.get(&from).unwrap().0,
+                    &self.bridges.get(&to).unwrap().0,
+                )?;
+                *state = State::Deployed;
+            }
+        }
+
+        let data = &mut self.instances;
 
         let network = &data.network;
         let commands = &data.commands;
@@ -154,10 +207,14 @@ impl Env {
         let tasks = &mut data.tasks;
 
         let since = std::time::Instant::now();
-        let zipped = state.values_mut().zip(network.values());
-        for (state, network) in zipped {
+        let zipped = state.iter_mut().zip(network.values());
+        for ((index, state), network) in zipped {
             if let State::Pending = state {
-                deploy(&self.bridge, network)?;
+                let bridge = self
+                    .bridges
+                    .get(&(index / self.cfg.instances_per_bridge))
+                    .unwrap();
+                deploy(&bridge.0, network)?;
                 *state = State::Deployed;
             }
         }
@@ -169,12 +226,7 @@ impl Env {
             .zip(network.values())
             .zip(commands.values());
         for (((index, state), network), command) in zipped {
-            let task = run(
-                *index,
-                network,
-                command,
-                &self.errors_sender.as_ref().unwrap(),
-            )?;
+            let task = run(*index, network, command, &self.errors_sender)?;
             tasks.insert(*index, task);
             *state = State::Running;
         }
@@ -183,15 +235,8 @@ impl Env {
     }
 
     pub fn run(mut self, f: impl FnOnce(&mut Self)) -> Result<()> {
-        let rst = {
-            let rst = shell::bridge_apply(&self.bridge);
-            if rst.is_err() {
-                return rst;
-            }
-            f(&mut self);
-            Ok(())
-        };
-        let data = &mut self.data;
+        f(&mut self);
+        let data = &mut self.instances;
         let tasks = &mut data.tasks;
         for task in tasks.iter_mut() {
             if let Err(err) = stop(task.1) {
@@ -209,11 +254,24 @@ impl Env {
                     tracing::error!("failed to cleanup network {}: {:?}", index, err);
                 }
             }
-            if let Err(err) = shell::bridge_revert(&self.bridge) {
-                tracing::debug!("failed to revert bridge: {:?}", err);
-            };
+            for ((from, to), state) in self.connects.iter_mut() {
+                if let Err(err) = shell::bridge_disconnect(
+                    &self.cfg.prefix,
+                    &self.bridges.get(from).unwrap().0,
+                    &self.bridges.get(to).unwrap().0,
+                ) {
+                    tracing::debug!("failed to disconnect bridges: {:?}", err);
+                }
+                *state = State::Pending;
+            }
+            for (bridge, state) in self.bridges.values_mut() {
+                if let Err(err) = shell::bridge_revert(bridge) {
+                    tracing::debug!("failed to revert bridge {:?}", err);
+                }
+                *state = State::Pending;
+            }
         }
-        rst
+        Ok(())
     }
 }
 
@@ -228,7 +286,7 @@ fn random_suffix(n: usize) -> String {
 #[derive(Debug)]
 struct NetworkData {
     namespace: Namespace,
-    veth: Veth,
+    veth: NamespaceVeth,
     qdisc: Option<Qdisc>,
 }
 
@@ -248,14 +306,14 @@ enum State {
 }
 
 #[derive(Debug)]
-struct EnvData {
+struct Instances {
     network: BTreeMap<usize, NetworkData>,
     commands: BTreeMap<usize, CommandData>,
     tasks: BTreeMap<usize, TaskData>,
     state: BTreeMap<usize, State>,
 }
 
-impl EnvData {
+impl Instances {
     fn new() -> Self {
         Self {
             network: BTreeMap::new(),

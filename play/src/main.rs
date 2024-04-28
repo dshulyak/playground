@@ -267,7 +267,7 @@ fn run(mut cmd: Command, opts: &Run) {
 
 fn cleanup(mut cmd: Command, opts: &Cleanup) {
     let bridges = {
-        match playground::cleanup_bridges(&opts.prefix) {
+        match playground::shell::bridge_cleanup(&opts.prefix) {
             Ok(bridges) => bridges,
             Err(err) => {
                 cmd.error(ErrorKind::Io, format!("{:?}", err)).exit();
@@ -275,7 +275,7 @@ fn cleanup(mut cmd: Command, opts: &Cleanup) {
         }
     };
     let namespaces = {
-        match playground::cleanup_namespaces(&opts.prefix) {
+        match playground::shell::namespace_cleanup(&opts.prefix) {
             Ok(namespaces) => namespaces,
             Err(err) => {
                 cmd.error(ErrorKind::Io, format!("{:?}", err)).exit();
@@ -283,7 +283,7 @@ fn cleanup(mut cmd: Command, opts: &Cleanup) {
         }
     };
     let veth = {
-        match playground::cleanup_veth(&opts.prefix) {
+        match playground::shell::veth_cleanup(&opts.prefix) {
             Ok(veth) => veth,
             Err(err) => {
                 cmd.error(ErrorKind::Io, format!("{:?}", err)).exit();

@@ -7,7 +7,7 @@ use anyhow::{bail, Context, Result};
 use crossbeam::{channel::Sender, select};
 use humantime::Duration;
 
-use crate::network::{Drop, Veth};
+use crate::{network, shell};
 
 #[derive(Debug, Clone)]
 pub struct Partition {
@@ -48,12 +48,12 @@ impl Partition {
 
 pub(crate) struct PartitionTask {
     partition: Partition,
-    instances: Vec<Veth>,
-    enabled: HashSet<Drop>,
+    instances: Vec<network::Veth>,
+    enabled: HashSet<(network::Veth, network::Veth)>,
 }
 
 impl PartitionTask {
-    pub(crate) fn new(partition: Partition, instances: Vec<Veth>) -> Self {
+    pub(crate) fn new(partition: Partition, instances: Vec<network::Veth>) -> Self {
         Self {
             partition,
             instances,
@@ -63,7 +63,7 @@ impl PartitionTask {
 
     pub(crate) fn apply(&mut self) -> Result<()> {
         let len = self.instances.len();
-        let mut buckets: Vec<Vec<Veth>> = vec![];
+        let mut buckets: Vec<Vec<network::Veth>> = vec![];
         let mut instances = self.instances.iter();
         for bucket in self.partition.buckets.iter() {
             buckets.push(
@@ -82,9 +82,8 @@ impl PartitionTask {
                 .flat_map(|(_, b)| b.iter())
             {
                 for from in bucket {
-                    let drop = Drop::new(from.ns().clone(), to.ip_addr());
-                    drop.apply()?;
-                    self.enabled.insert(drop);
+                    shell::drop_packets_apply(from, to)?;
+                    self.enabled.insert((from.clone(), to.clone()));
                 }
             }
         }
@@ -92,8 +91,8 @@ impl PartitionTask {
     }
 
     pub(crate) fn revert(&mut self) -> Result<()> {
-        for drop in self.enabled.drain() {
-            drop.revert()?;
+        for (from, to) in self.enabled.drain() {
+            shell::drop_packets_revert(&from, &to)?;
         }
         Ok(())
     }

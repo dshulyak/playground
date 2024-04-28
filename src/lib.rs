@@ -15,6 +15,7 @@ use rand::{thread_rng, Rng};
 
 mod network;
 pub mod partition;
+pub mod shell;
 
 use crate::network::{Bridge, Namespace, Qdisc, Veth};
 
@@ -28,9 +29,9 @@ pub struct Config {
 
 impl Config {
     pub fn new() -> Self {
-        Config{
+        Config {
             prefix: format!("p-{}", random_suffix(4)),
-            net:  IpNet::from_str("10.0.0.0/16").unwrap(),
+            net: IpNet::from_str("10.0.0.0/16").unwrap(),
             revert: true,
             redirect: false,
         }
@@ -62,13 +63,12 @@ impl Config {
     }
 }
 
-
 pub struct Env {
     cfg: Config,
     hosts: IpAddrRange,
     next: usize,
     data: EnvData,
-    bridge: Option<Bridge>,
+    bridge: Bridge,
     errors_sender: Option<Sender<anyhow::Result<()>>>,
     errors_receiver: Receiver<anyhow::Result<()>>,
     partition: Option<PartitionBackground>,
@@ -76,16 +76,17 @@ pub struct Env {
 
 impl Env {
     fn new(cfg: Config) -> Self {
-        let (errors_sender, errors_receiver) = unbounded();
-        let hosts = cfg.net.hosts();
+        let (sender, receiver) = unbounded();
+        let mut hosts = cfg.net.hosts();
+        let bridge = Bridge::new(&cfg.prefix, hosts.next().expect("empty hosts range"));
         Env {
             cfg: cfg,
             hosts: hosts,
             next: 0,
-            bridge: None,
+            bridge: bridge,
             data: EnvData::new(),
-            errors_sender: Some(errors_sender),
-            errors_receiver,
+            errors_sender: Some(sender),
+            errors_receiver: receiver,
             partition: None,
         }
     }
@@ -121,15 +122,15 @@ impl Env {
             .next()
             .ok_or_else(|| anyhow::anyhow!("run out of ip addresses"))?;
         let ns = Namespace::new(&self.cfg.prefix, index);
-        let veth = Veth::new(ip, self.bridge.as_ref().unwrap().clone(), ns.clone());
+        let veth = Veth::new(ip, ns.clone());
         let current_dir = env::current_dir().context("failed to get current directory")?;
         let work_dir: &PathBuf = work_dir.as_ref().unwrap_or_else(|| &current_dir);
 
         let network = NetworkData {
             namespace: ns,
-            veth: veth.clone(),
+            veth: veth,
             qdisc: if tbf.is_some() || netem.is_some() {
-                Some(Qdisc::new(veth.clone(), tbf, netem))
+                Some(Qdisc { tbf, netem })
             } else {
                 None
             },
@@ -156,7 +157,7 @@ impl Env {
         let zipped = state.values_mut().zip(network.values());
         for (state, network) in zipped {
             if let State::Pending = state {
-                deploy(network)?;
+                deploy(&self.bridge, network)?;
                 *state = State::Deployed;
             }
         }
@@ -183,13 +184,7 @@ impl Env {
 
     pub fn run(mut self, f: impl FnOnce(&mut Self)) -> Result<()> {
         let rst = {
-            let ip = self
-                .hosts
-                .next()
-                .ok_or_else(|| anyhow::anyhow!("no ip address for bridge"))?;
-            let bridge = Bridge::new(&self.cfg.prefix, ip);
-            let rst = bridge.apply();
-            self.bridge = Some(bridge);
+            let rst = shell::bridge_apply(&self.bridge);
             if rst.is_err() {
                 return rst;
             }
@@ -214,26 +209,12 @@ impl Env {
                     tracing::error!("failed to cleanup network {}: {:?}", index, err);
                 }
             }
-            if let Some(bridge) = self.bridge.take() {
-                if let Err(err) = bridge.revert() {
-                    tracing::debug!("failed to revert bridge: {:?}", err);
-                };
-            }
+            if let Err(err) = shell::bridge_revert(&self.bridge) {
+                tracing::debug!("failed to revert bridge: {:?}", err);
+            };
         }
         rst
     }
-}
-
-pub fn cleanup_bridges(prefix: &str) -> Result<usize> {
-    Bridge::cleanup(prefix)
-}
-
-pub fn cleanup_veth(prefix: &str) -> Result<usize> {
-    Veth::cleanup(prefix)
-}
-
-pub fn cleanup_namespaces(prefix: &str) -> Result<usize> {
-    Namespace::cleanup(prefix)
 }
 
 fn random_suffix(n: usize) -> String {
@@ -292,11 +273,11 @@ impl EnvData {
     }
 }
 
-fn deploy(network: &NetworkData) -> anyhow::Result<()> {
-    network.namespace.apply()?;
-    network.veth.apply()?;
+fn deploy(bridge: &network::Bridge, network: &NetworkData) -> anyhow::Result<()> {
+    shell::namespace_apply(&network.namespace)?;
+    shell::veth_apply(&network.veth, bridge)?;
     if let Some(qdisc) = &network.qdisc {
-        qdisc.apply()?;
+        shell::qdisc_apply(&network.veth, qdisc)?;
     }
     Ok(())
 }
@@ -422,10 +403,10 @@ fn stop(task: &mut TaskData) -> Result<()> {
 }
 
 fn cleanup(network: &NetworkData) -> anyhow::Result<()> {
-    if let Err(err) = network.veth.revert() {
+    if let Err(err) = shell::veth_revert(&network.veth) {
         tracing::debug!("failed to revert veth: {:?}", err);
     }
-    if let Err(err) = network.namespace.revert() {
+    if let Err(err) = shell::namespace_revert(&network.namespace) {
         tracing::debug!("failed to revert namespace: {:?}", err);
     }
     Ok(())

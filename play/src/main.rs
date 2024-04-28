@@ -1,7 +1,7 @@
 use anyhow::Result;
 use clap::{error::ErrorKind, Command, CommandFactory, Parser, Subcommand};
 use crossbeam::{channel::unbounded, select};
-use playground::{partition::Partition, Env};
+use playground::{partition::Partition, Config};
 use std::{path::PathBuf, str::FromStr};
 use tracing::metadata::LevelFilter;
 
@@ -194,12 +194,12 @@ fn run(mut cmd: Command, opts: &Run) {
     }
 
     if let Err(err) = {
-        let env = Env::new()
+        let cfg = Config::new()
             .with_network(opts.cidr.clone())
             .with_prefix(opts.unique_name())
             .with_revert(!opts.no_revert)
             .with_redirect(opts.redirect);
-        env.run(|e| {
+        cfg.run(|e| {
             let first_tbf = opts.tbf.first().map(|t| t.clone());
             let first_netem = opts.netem.first().map(|n| n.clone());
             let first_count = opts.counts.first().copied().unwrap_or(1);

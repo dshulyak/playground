@@ -18,34 +18,21 @@ pub mod partition;
 
 use crate::network::{Bridge, Namespace, Qdisc, Veth};
 
-pub struct Env {
+pub struct Config {
     prefix: String,
-    hosts: IpAddrRange,
-    next: usize,
-    data: EnvData,
-    bridge: Option<Bridge>,
-    errors_sender: Option<Sender<anyhow::Result<()>>>,
-    errors_receiver: Receiver<anyhow::Result<()>>,
+    net: IpNet,
     revert: bool,
     // redirect stdout and stderr to files in the working directories
     redirect: bool,
-    partition: Option<PartitionBackground>,
 }
 
-impl Env {
+impl Config {
     pub fn new() -> Self {
-        let (errors_sender, errors_receiver) = unbounded();
-        Env {
+        Config{
             prefix: format!("p-{}", random_suffix(4)),
-            hosts: IpNet::from_str("10.0.0.0/16").unwrap().hosts(),
-            next: 0,
-            bridge: None,
-            data: EnvData::new(),
-            errors_sender: Some(errors_sender),
-            errors_receiver,
+            net:  IpNet::from_str("10.0.0.0/16").unwrap(),
             revert: true,
             redirect: false,
-            partition: None,
         }
     }
 
@@ -54,8 +41,8 @@ impl Env {
         self
     }
 
-    pub fn with_network(mut self, network: IpNet) -> Self {
-        self.hosts = network.hosts();
+    pub fn with_network(mut self, net: IpNet) -> Self {
+        self.net = net;
         self
     }
 
@@ -67,6 +54,40 @@ impl Env {
     pub fn with_redirect(mut self, redirect: bool) -> Self {
         self.redirect = redirect;
         self
+    }
+
+    pub fn run(self, f: impl FnOnce(&mut Env)) -> Result<()> {
+        let env = Env::new(self);
+        env.run(f)
+    }
+}
+
+
+pub struct Env {
+    cfg: Config,
+    hosts: IpAddrRange,
+    next: usize,
+    data: EnvData,
+    bridge: Option<Bridge>,
+    errors_sender: Option<Sender<anyhow::Result<()>>>,
+    errors_receiver: Receiver<anyhow::Result<()>>,
+    partition: Option<PartitionBackground>,
+}
+
+impl Env {
+    fn new(cfg: Config) -> Self {
+        let (errors_sender, errors_receiver) = unbounded();
+        let hosts = cfg.net.hosts();
+        Env {
+            cfg: cfg,
+            hosts: hosts,
+            next: 0,
+            bridge: None,
+            data: EnvData::new(),
+            errors_sender: Some(errors_sender),
+            errors_receiver,
+            partition: None,
+        }
     }
 
     pub fn errors(&self) -> &Receiver<anyhow::Result<()>> {
@@ -99,7 +120,7 @@ impl Env {
             .hosts
             .next()
             .ok_or_else(|| anyhow::anyhow!("run out of ip addresses"))?;
-        let ns = Namespace::new(&self.prefix, index);
+        let ns = Namespace::new(&self.cfg.prefix, index);
         let veth = Veth::new(ip, self.bridge.as_ref().unwrap().clone(), ns.clone());
         let current_dir = env::current_dir().context("failed to get current directory")?;
         let work_dir: &PathBuf = work_dir.as_ref().unwrap_or_else(|| &current_dir);
@@ -117,7 +138,7 @@ impl Env {
             command: cmd,
             work_dir: work_dir.clone(),
             os_env,
-            redirect: self.redirect,
+            redirect: self.cfg.redirect,
         };
         self.data.add(index, network, command);
         Ok(index)
@@ -166,7 +187,7 @@ impl Env {
                 .hosts
                 .next()
                 .ok_or_else(|| anyhow::anyhow!("no ip address for bridge"))?;
-            let bridge = Bridge::new(&self.prefix, ip);
+            let bridge = Bridge::new(&self.cfg.prefix, ip);
             let rst = bridge.apply();
             self.bridge = Some(bridge);
             if rst.is_err() {
@@ -187,7 +208,7 @@ impl Env {
         if let Some(partition) = self.partition.take() {
             partition.stop();
         }
-        if self.revert {
+        if self.cfg.revert {
             for (index, network) in data.network.iter() {
                 if let Err(err) = cleanup(network) {
                     tracing::error!("failed to cleanup network {}: {:?}", index, err);

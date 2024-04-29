@@ -12,6 +12,7 @@ use ipnet::{IpAddrRange, IpNet};
 use rand::distributions::Alphanumeric;
 use rand::{thread_rng, Rng};
 
+mod netlink;
 mod network;
 pub mod partition;
 pub mod shell;
@@ -78,11 +79,6 @@ impl Config {
         self.redirect = redirect;
         self
     }
-
-    pub fn run(self, f: impl FnOnce(&mut Env)) -> anyhow::Result<()> {
-        let env = Env::new(self);
-        env.run(f)
-    }
 }
 
 pub struct Env {
@@ -98,7 +94,7 @@ pub struct Env {
 }
 
 impl Env {
-    fn new(cfg: Config) -> Self {
+    pub fn new(cfg: Config) -> Self {
         let (sender, receiver) = unbounded();
         let hosts = cfg.net.hosts();
         Env {
@@ -184,7 +180,7 @@ impl Env {
     pub fn deploy(&mut self) -> anyhow::Result<()> {
         for (bridge, state) in self.bridges.values_mut() {
             if let State::Pending = state {
-                shell::bridge_apply(bridge)?;
+                netlink::bridge_apply(bridge)?;
                 *state = State::Deployed;
             }
         }
@@ -208,13 +204,18 @@ impl Env {
 
         let since = std::time::Instant::now();
         let zipped = state.iter_mut().zip(network.values());
+
         for ((index, state), network) in zipped {
             if let State::Pending = state {
                 let bridge = self
                     .bridges
                     .get(&(index / self.cfg.instances_per_bridge))
                     .unwrap();
-                deploy(&bridge.0, network)?;
+                netlink::namespace_apply(&network.namespace)?;
+                netlink::veth_apply(&network.veth, &bridge.0)?;
+                if let Some(qdisc) = &network.qdisc {
+                    shell::qdisc_apply(&network.veth, qdisc)?;
+                }
                 *state = State::Deployed;
             }
         }
@@ -234,26 +235,42 @@ impl Env {
         Ok(())
     }
 
-    pub fn run(mut self, f: impl FnOnce(&mut Self)) -> Result<()> {
-        f(&mut self);
+    pub fn clear(&mut self) -> anyhow::Result<()> {
         let data = &mut self.instances;
         let tasks = &mut data.tasks;
+
+        let since = std::time::Instant::now();
         for task in tasks.iter_mut() {
-            if let Err(err) = stop(task.1) {
+            if let Err(err) = kill(task.1) {
+                tracing::error!("failed to kill task {}: {:?}", task.0, err);
+            }
+        }
+        for task in tasks.iter_mut() {
+            if let Err(err) = wait(task.1) {
                 tracing::error!("failed to stop task {}: {:?}", task.0, err);
             }
         }
+        tracing::info!("commands stopped in {:?}", since.elapsed());
         tasks.clear();
 
         if let Some(partition) = self.partition.take() {
             partition.stop();
         }
         if self.cfg.revert {
-            for (index, network) in data.network.iter() {
-                if let Err(err) = cleanup(network) {
-                    tracing::error!("failed to cleanup network {}: {:?}", index, err);
+            let since = std::time::Instant::now();
+            for network in data.network.values() {
+                if let Err(err) = netlink::veth_revert(&network.veth) {
+                    tracing::debug!("failed to revert veth: {:?}", err);
+                }   
+            }
+            tracing::info!("reverted veth config in {:?}", since.elapsed());
+            for network in data.network.values() {
+                if let Err(err) = netlink::namespace_revert(&network.namespace) {
+                    tracing::debug!("failed to revert namespace: {:?}", err);
                 }
             }
+            tracing::info!("reverted network config in {:?}", since.elapsed());
+
             for ((from, to), state) in self.connects.iter_mut() {
                 if let Err(err) = shell::bridge_disconnect(
                     &self.cfg.prefix,
@@ -329,15 +346,6 @@ impl Instances {
         self.state.insert(index, State::Pending);
         index
     }
-}
-
-fn deploy(bridge: &network::Bridge, network: &NetworkData) -> anyhow::Result<()> {
-    shell::namespace_apply(&network.namespace)?;
-    shell::veth_apply(&network.veth, bridge)?;
-    if let Some(qdisc) = &network.qdisc {
-        shell::qdisc_apply(&network.veth, qdisc)?;
-    }
-    Ok(())
 }
 
 #[derive(Debug)]
@@ -439,8 +447,12 @@ fn run(
     })
 }
 
-fn stop(task: &mut TaskData) -> Result<()> {
+fn kill(task: &mut TaskData) -> Result<()> {
     task.process.kill().context("kill process")?;
+    Ok(())
+}
+
+fn wait(task: &mut TaskData) -> Result<()> {
     match task.process.wait() {
         Ok(status) if status.code().is_none() => {
             tracing::debug!("command was terminated by signal: {}", status);
@@ -456,16 +468,6 @@ fn stop(task: &mut TaskData) -> Result<()> {
     }
     for handler in task.output_handlers.drain(..) {
         _ = handler.join();
-    }
-    Ok(())
-}
-
-fn cleanup(network: &NetworkData) -> anyhow::Result<()> {
-    if let Err(err) = shell::veth_revert(&network.veth) {
-        tracing::debug!("failed to revert veth: {:?}", err);
-    }
-    if let Err(err) = shell::namespace_revert(&network.namespace) {
-        tracing::debug!("failed to revert namespace: {:?}", err);
     }
     Ok(())
 }

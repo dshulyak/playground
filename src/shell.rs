@@ -1,6 +1,7 @@
+#![allow(dead_code)]
+
 use std::{
     collections::HashMap,
-    net::IpAddr,
     process::{Command, Stdio},
 };
 
@@ -32,13 +33,6 @@ fn execute(cmd: &str) -> Result<Vec<u8>> {
     Ok(output.stdout)
 }
 
-fn addr_to_string(addr: IpAddr) -> String {
-    match addr {
-        IpAddr::V4(addr) => format!("{}/24", addr),
-        IpAddr::V6(addr) => format!("{}/64", addr),
-    }
-}
-
 pub(crate) fn veth_apply(veth: &network::NamespaceVeth, master: &network::Bridge) -> Result<()> {
     execute(&format!(
         "ip link add {} type veth peer name {}",
@@ -58,7 +52,7 @@ pub(crate) fn veth_apply(veth: &network::NamespaceVeth, master: &network::Bridge
     execute(&format!(
         "ip -n {} addr add {} dev {}",
         veth.namespace.name,
-        addr_to_string(veth.addr),
+        veth.addr.to_string_with_prefix(),
         veth.guest()
     ))?;
     execute(&format!(
@@ -71,6 +65,7 @@ pub(crate) fn veth_apply(veth: &network::NamespaceVeth, master: &network::Bridge
 }
 
 pub(crate) fn veth_revert(veth: &network::NamespaceVeth) -> Result<()> {
+    execute(&format!("ip link del {}", veth.host()))?;
     execute(&format!(
         "ip -n {} link del {}",
         veth.namespace.name,
@@ -106,12 +101,12 @@ pub(crate) fn qdisc_apply(veth: &network::NamespaceVeth, qdisc: &network::Qdisc)
 
 pub(crate) fn bridge_apply(bridge: &network::Bridge) -> Result<()> {
     execute(&format!("ip link add {} type bridge", bridge.name))?;
-    execute(&format!("ip link set {} up", bridge.name))?;
     execute(&format!(
         "ip addr add {} dev {}",
-        addr_to_string(bridge.addr),
+        bridge.addr.to_string_with_prefix(),
         bridge.name
     ))?;
+    execute(&format!("ip link set {} up", bridge.name))?;
     Ok(())
 }
 
@@ -170,7 +165,7 @@ pub fn veth_cleanup(prefix: &str) -> Result<usize> {
     let output = execute("ip -json link show type veth")?;
     let veths: Vec<HashMap<String, Value>> = serde_json::from_slice(&output)?;
     let mut count = 0;
-    let prefix = format!("veth-{}", prefix);
+    let prefix = format!("v-{}", prefix);
     for veth in veths {
         match &veth["ifname"] {
             Value::String(ifname) if ifname.starts_with(prefix.as_str()) => {

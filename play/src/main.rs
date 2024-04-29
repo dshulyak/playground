@@ -4,7 +4,7 @@ use crossbeam::{
     channel::{unbounded, Receiver},
     select,
 };
-use playground::{partition::Partition, Config};
+use playground::{partition::Partition, Config, Env};
 use std::{path::PathBuf, str::FromStr};
 use tracing::metadata::LevelFilter;
 
@@ -65,7 +65,7 @@ EXAMPLES:
     env: Vec<EnvValue>,
     #[clap(
         long = "cidr",
-        default_value = "10.0.0.0/24",
+        default_value = "10.0.0.0/16",
         help = "every command instance will be given IP address from a cidr. 
 cidr is expected to have as many addresses as th sum of all commands instances"
     )]
@@ -200,82 +200,85 @@ fn run(mut cmd: Command, opts: &Run) {
         )
         .exit();
     }
-
-    if let Err(err) = run_error(opts, tx) {
-        cmd.error(ErrorKind::Io, format!("{:?}", err)).exit();
-    }
-}
-
-fn run_error(opts: &Run, tx: Receiver<()>) -> Result<()> {
     let mut cfg = Config::new()
         .with_network(opts.cidr)
         .with_prefix(opts.unique_name())
         .with_revert(!opts.no_revert)
         .with_redirect(opts.redirect);
     if let Some(instances_per_bridge) = opts.instances_per_bridge {
-        cfg = cfg.with_instances_per_bridge(instances_per_bridge)?;
+        cfg = match cfg.with_instances_per_bridge(instances_per_bridge) {
+            Ok(cfg) => cfg,
+            Err(err) => {
+                cmd.error(ErrorKind::ValueValidation, format!("{:?}", err))
+                    .exit();
+            }
+        };
     }
-    cfg.run(|e| {
-        let first_tbf = opts.tbf.first().map(|t| t.clone());
-        let first_netem = opts.netem.first().map(|n| n.clone());
-        let first_count = opts.counts.first().copied().unwrap_or(1);
-        let first_work_dir = opts.work_dirs.first().map(|w| w.clone());
-        for (i, cmd) in opts.commands.iter().enumerate() {
-            for _ in 0..opts.counts.get(i).copied().unwrap_or(first_count) {
-                let tbf = opts
-                    .tbf
-                    .get(i)
-                    .map_or(first_tbf.clone(), |t| Some(t.clone()));
-                let netem = opts
-                    .netem
-                    .get(i)
-                    .map_or(first_netem.clone(), |n| Some(n.clone()));
+    let mut e = Env::new(cfg);
+    let err = run_error(opts, &mut e, tx);
+    let _ = e.clear();
+    if let Err(err) = err {
+        cmd.error(ErrorKind::Io, format!("{:?}", err)).exit();
+    }
+}
 
-                let work_dir = opts
-                    .work_dirs
-                    .get(i)
-                    .or(first_work_dir.as_ref())
-                    .map(|w| w.clone());
+fn run_error(opts: &Run, e: &mut Env, tx: Receiver<()>) -> Result<()> {
+    let first_tbf = opts.tbf.first().map(|t| t.clone());
+    let first_netem = opts.netem.first().map(|n| n.clone());
+    let first_count = opts.counts.first().copied().unwrap_or(1);
+    let first_work_dir = opts.work_dirs.first().map(|w| w.clone());
+    for (i, cmd) in opts.commands.iter().enumerate() {
+        for _ in 0..opts.counts.get(i).copied().unwrap_or(first_count) {
+            let tbf = opts
+                .tbf
+                .get(i)
+                .map_or(first_tbf.clone(), |t| Some(t.clone()));
+            let netem = opts
+                .netem
+                .get(i)
+                .map_or(first_netem.clone(), |n| Some(n.clone()));
 
-                let _ = match e.add(
-                    cmd.clone(),
-                    work_dir.clone(),
-                    tbf,
-                    netem,
-                    opts.env
-                        .iter()
-                        .map(|e| (e.0.clone(), e.1.clone()))
-                        .collect(),
-                ) {
-                    Ok(id) => id,
-                    Err(err) => {
-                        tracing::error!("failed to run command: {:?}", err);
-                        return;
-                    }
-                };
+            let work_dir = opts
+                .work_dirs
+                .get(i)
+                .or(first_work_dir.as_ref())
+                .map(|w| w.clone());
+
+            let _ = e.add(
+                cmd.clone(),
+                work_dir.clone(),
+                tbf,
+                netem,
+                opts.env
+                    .iter()
+                    .map(|e| (e.0.clone(), e.1.clone()))
+                    .collect(),
+            )?;
+        }
+    }
+    let since = std::time::Instant::now();
+    e.deploy()?;
+    tracing::info!("playground deployed in {:?}", since.elapsed());
+    if let Some(partition) = &opts.partition {
+        e.enable_partition(partition.clone())?;
+    }
+    select! {
+        recv(tx) -> _ => {
+            tracing::debug!("received interrupt on the channel");
+        }
+        recv(e.errors()) -> err => {
+            match err {
+                Ok(err) => {
+                    tracing::error!("error in playground: {:?}", err);
+                }
+                Err(_) => {
+                    tracing::info!("playground completed successfully");
+                }
+
             }
         }
-        let since = std::time::Instant::now();
-        if let Err(err) = e.deploy() {
-            tracing::error!("failed to deploy playground: {:?}", err);
-            return;
-        }
-        tracing::info!("playground deployed in {:?}", since.elapsed());
-        if let Some(partition) = &opts.partition {
-            if let Err(err) = e.enable_partition(partition.clone()) {
-                tracing::error!("failed to spinup partition agent network: {:?}", err);
-                return;
-            }
-        }
-        select! {
-            recv(tx) -> _ => {
-                tracing::debug!("received interrupt on the channel");
-            }
-            recv(e.errors()) -> err => {
-                tracing::error!("error in playground: {:?}", err);
-            }
-        }
-    })
+    }
+    Ok(())
 }
 
 fn cleanup(mut cmd: Command, opts: &Cleanup) {

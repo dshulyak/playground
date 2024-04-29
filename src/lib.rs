@@ -257,36 +257,42 @@ impl Env {
             partition.stop();
         }
         if self.cfg.revert {
-            let since = std::time::Instant::now();
-            for network in data.network.values() {
-                if let Err(err) = netlink::veth_revert(&network.veth) {
-                    tracing::debug!("failed to revert veth: {:?}", err);
-                }   
-            }
-            tracing::info!("reverted veth config in {:?}", since.elapsed());
-            for network in data.network.values() {
-                if let Err(err) = netlink::namespace_revert(&network.namespace) {
-                    tracing::debug!("failed to revert namespace: {:?}", err);
-                }
-            }
-            tracing::info!("reverted network config in {:?}", since.elapsed());
+            self.revert_network()?;
+        }
+        Ok(())
+    }
 
-            for ((from, to), state) in self.connects.iter_mut() {
-                if let Err(err) = shell::bridge_disconnect(
-                    &self.cfg.prefix,
-                    &self.bridges.get(from).unwrap().0,
-                    &self.bridges.get(to).unwrap().0,
-                ) {
-                    tracing::debug!("failed to disconnect bridges: {:?}", err);
-                }
-                *state = State::Pending;
+    fn revert_network(&mut self) -> Result<()> {
+        let data = &mut self.instances;
+        let since = std::time::Instant::now();
+        for network in data.network.values() {
+            if let Err(err) = netlink::veth_revert(&network.veth) {
+                tracing::debug!("failed to revert veth: {:?}", err);
             }
-            for (bridge, state) in self.bridges.values_mut() {
-                if let Err(err) = shell::bridge_revert(bridge) {
-                    tracing::debug!("failed to revert bridge {:?}", err);
-                }
-                *state = State::Pending;
+        }
+        tracing::info!("reverted veth config in {:?}", since.elapsed());
+        for network in data.network.values() {
+            if let Err(err) = netlink::namespace_revert(&network.namespace) {
+                tracing::debug!("failed to revert namespace: {:?}", err);
             }
+        }
+        tracing::info!("reverted network config in {:?}", since.elapsed());
+
+        for ((from, to), state) in self.connects.iter_mut() {
+            if let Err(err) = shell::bridge_disconnect(
+                &self.cfg.prefix,
+                &self.bridges.get(from).unwrap().0,
+                &self.bridges.get(to).unwrap().0,
+            ) {
+                tracing::debug!("failed to disconnect bridges: {:?}", err);
+            }
+            *state = State::Pending;
+        }
+        for (bridge, state) in self.bridges.values_mut() {
+            if let Err(err) = shell::bridge_revert(bridge) {
+                tracing::debug!("failed to revert bridge {:?}", err);
+            }
+            *state = State::Pending;
         }
         Ok(())
     }

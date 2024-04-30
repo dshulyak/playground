@@ -19,7 +19,9 @@ play cleanup
 ### Library
 
 
-### Knowns workarounds
+### Sysctl modifications
+
+When run tool will modify the following sysctl options.
 
 - arp cache threshing, can be diagnosed by looking at dmesg
 ```

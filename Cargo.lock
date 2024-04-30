@@ -1855,6 +1855,7 @@ dependencies = [
  "netns-rs",
  "rand",
  "serde_json",
+ "sysctl",
  "tracing",
  "tracing-subscriber",
 ]

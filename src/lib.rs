@@ -14,6 +14,7 @@ use rand::{thread_rng, Rng};
 
 mod netlink;
 mod network;
+mod sysctl;
 pub mod partition;
 pub mod shell;
 
@@ -178,6 +179,10 @@ impl Env {
     }
 
     pub fn deploy(&mut self) -> anyhow::Result<()> {
+        sysctl::disable_bridge_nf_call_iptables()?;
+        // TODO parametrize this, it starts to be an issue with certain number of instances
+        sysctl::ipv4_neigh_gc_threash3(2048000)?;
+
         for (bridge, state) in self.bridges.values_mut() {
             if let State::Pending = state {
                 netlink::bridge_apply(bridge)?;

@@ -238,3 +238,26 @@ pub(crate) fn bridge_disconnect(
     execute(&format!("ip link del {}", pair1))?;
     Ok(())
 }
+
+pub(crate) fn vxlan_apply(bridge: &network::Bridge, vxlan: &network::Vxlan) -> Result<()> {
+    execute(&format!(
+        "ip link add {name} type vxlan id {id} group {group} dev {device} dstport {port}",
+        name = vxlan.name,
+        id = vxlan.id,
+        group = vxlan.group,
+        device = vxlan.device,
+        port = vxlan.port,
+    ))?;
+    execute(&format!(
+        "ip link set {name} master {bridge}",
+        name = vxlan.name,
+        bridge = bridge.name,
+    ))?;
+    execute(&format!("ip link set {name} up", name = vxlan.name,))?;
+    Ok(())
+}
+
+pub(crate) fn vxlan_revert(vxlan: &network::Vxlan) -> Result<()> {
+    execute(&format!("ip link del {name}", name = vxlan.name))?;
+    Ok(())
+}

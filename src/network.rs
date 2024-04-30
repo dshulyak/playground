@@ -96,3 +96,12 @@ pub(crate) struct Qdisc {
     pub(crate) tbf: Option<String>,
     pub(crate) netem: Option<String>,
 }
+
+#[derive(Debug, Clone)]
+pub(crate) struct Vxlan {
+    pub(crate) name: String,
+    pub(crate) id: u32,
+    pub(crate) port: u16,
+    pub(crate) group: Ipv4Addr,
+    pub(crate) device: String,
+}

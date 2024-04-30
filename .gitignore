@@ -2,3 +2,4 @@
 *.out
 *.stdout
 *.stderr
+.vagrant

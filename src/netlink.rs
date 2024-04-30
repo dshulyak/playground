@@ -1,6 +1,6 @@
 #![allow(dead_code)]
 
-use std::os::fd::AsFd;
+use std::{net::Ipv4Addr, os::fd::AsFd};
 
 use anyhow::Result;
 
@@ -71,6 +71,13 @@ pub(crate) fn veth_apply(veth: &network::NamespaceVeth, bridge: &network::Bridge
 
     ns.netlink.set_up(LinkID::Name(veth.guest()))?;
     host.netlink.set_up(LinkID::Name(veth.host()))?;
+
+    let default_route = netlink::Route::Ipv4 { 
+        dest: ipnet::Ipv4Net::new(Ipv4Addr::new(0, 0, 0, 0), 0)?, 
+        gw: bridge.addr.ip4(), 
+        metric: None,
+    };
+    ns.netlink.add_route(&default_route)?;
     Ok(())
 }
 

@@ -1,7 +1,7 @@
 use sysctl::Sysctl;
 
 pub(crate) fn ensure_value(name: &str, value: &str) -> anyhow::Result<()> {
-    tracing::debug!("setting sysctl {} to {}", name, value);
+    tracing::debug!("sysctl -w {}={}", name, value);
     let ctl = sysctl::Ctl::new(name)?;
     match ctl.value_string() {
         Ok(v) if v == value => Ok(()),
@@ -20,4 +20,8 @@ pub(crate) fn disable_bridge_nf_call_iptables() -> anyhow::Result<()> {
 
 pub(crate) fn ipv4_neigh_gc_threash3(value: u32) -> anyhow::Result<()> {
     ensure_value("net.ipv4.neigh.default.gc_thresh3", &value.to_string())
+}
+
+pub(crate) fn enable_ipv4_forwarding() -> anyhow::Result<()> {
+    ensure_value("net.ipv4.ip_forward", "1")
 }

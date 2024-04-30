@@ -1,9 +1,18 @@
-use std::fmt::Display;
+use std::{fmt::Display, net::Ipv4Addr};
 
 use ipnet::IpNet;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) struct Addr(IpNet);
+
+impl Addr {
+    pub(crate) fn ip4(&self) -> Ipv4Addr {
+        match self.0.addr() {
+            std::net::IpAddr::V4(ip) => ip,
+            _ => panic!("not ipv4"),
+        }
+    }   
+}
 
 impl Display for Addr {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

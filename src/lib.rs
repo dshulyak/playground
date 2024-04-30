@@ -185,6 +185,7 @@ impl Env {
         sysctl::disable_bridge_nf_call_iptables()?;
         // TODO parametrize this, it starts to be an issue with certain number of instances
         sysctl::ipv4_neigh_gc_threash3(2048000)?;
+        sysctl::enable_ipv4_forwarding()?;
 
         for (bridge, state) in self.bridges.values_mut() {
             if let State::Pending = state {

@@ -52,7 +52,7 @@ pub(crate) fn veth_apply(veth: &network::NamespaceVeth, master: &network::Bridge
     execute(&format!(
         "ip -n {} addr add {} dev {}",
         veth.namespace.name,
-        veth.addr.to_string_with_prefix(),
+        veth.addr.to_string(),
         veth.guest()
     ))?;
     execute(&format!(
@@ -103,7 +103,7 @@ pub(crate) fn bridge_apply(bridge: &network::Bridge) -> Result<()> {
     execute(&format!("ip link add {} type bridge", bridge.name))?;
     execute(&format!(
         "ip addr add {} dev {}",
-        bridge.addr.to_string_with_prefix(),
+        bridge.addr.to_string(),
         bridge.name
     ))?;
     execute(&format!("ip link set {} up", bridge.name))?;

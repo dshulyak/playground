@@ -1,6 +1,5 @@
 use sysctl::Sysctl;
 
-
 pub(crate) fn ensure_value(name: &str, value: &str) -> anyhow::Result<()> {
     tracing::debug!("setting sysctl {} to {}", name, value);
     let ctl = sysctl::Ctl::new(name)?;

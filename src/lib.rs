@@ -14,17 +14,18 @@ use rand::{thread_rng, Rng};
 
 mod netlink;
 mod network;
-mod sysctl;
 pub mod partition;
 pub mod shell;
+mod sysctl;
 
 use crate::network::{Bridge, Namespace, NamespaceVeth, Qdisc};
 
 // the primary limitation is the limit of ports enforced in the kernel (the limit is 1<<10)
 // https://github.com/torvalds/linux/blob/80e62bc8487b049696e67ad133c503bf7f6806f7/net/bridge/br_private.h#L28
 // https://github.com/moby/moby/issues/44973#issuecomment-1543733757
-// the veth is 0 based
-const MAX_VETH_PER_BRIDGE: usize = 1023;
+//
+// TODO debug why does it fail with 1023 instances
+const MAX_VETH_PER_BRIDGE: usize = 1000;
 
 pub struct Config {
     prefix: String,
@@ -127,6 +128,14 @@ impl Env {
         Ok(())
     }
 
+    fn next_addr(&mut self) -> Result<IpNet> {
+        let addr = self
+            .hosts
+            .next()
+            .ok_or(anyhow::anyhow!("run out of ip addresses"))?;
+        IpNet::new(addr, self.cfg.net.prefix_len()).context("failed to create ip network")
+    }
+
     pub fn add(
         &mut self,
         cmd: String,
@@ -139,23 +148,17 @@ impl Env {
         self.next += 1;
         let bridge_index = index / self.cfg.instances_per_bridge;
         if !self.bridges.contains_key(&bridge_index) {
-            let ip = self
-                .hosts
-                .next()
-                .ok_or_else(|| anyhow::anyhow!("run out of ip addresses"))?;
-            let bridge = Bridge::new(bridge_index, &self.cfg.prefix, ip);
+            let addr = self.next_addr()?;
+            let bridge = Bridge::new(bridge_index, &self.cfg.prefix, addr);
             self.bridges.insert(bridge_index, (bridge, State::Pending));
             for i in 0..bridge_index {
                 self.connects.insert((i, bridge_index), State::Pending);
             }
         }
 
-        let ip = self
-            .hosts
-            .next()
-            .ok_or_else(|| anyhow::anyhow!("run out of ip addresses"))?;
         let ns = Namespace::new(&self.cfg.prefix, index);
-        let veth = NamespaceVeth::new(ip, ns.clone());
+        let addr = self.next_addr()?;
+        let veth = NamespaceVeth::new(addr, ns.clone());
         let current_dir = env::current_dir().context("failed to get current directory")?;
         let work_dir: &PathBuf = work_dir.as_ref().unwrap_or_else(|| &current_dir);
 
@@ -201,7 +204,6 @@ impl Env {
         }
 
         let data = &mut self.instances;
-
         let network = &data.network;
         let commands = &data.commands;
         let state = &mut data.state;

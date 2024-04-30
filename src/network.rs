@@ -1,10 +1,9 @@
-use std::{fmt::Display, net::IpAddr};
+use std::fmt::Display;
 
 use ipnet::IpNet;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub(crate) struct Addr(IpAddr);
-
+pub(crate) struct Addr(IpNet);
 
 impl Display for Addr {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -13,33 +12,20 @@ impl Display for Addr {
 }
 
 impl Addr {
-    pub(crate) fn to_string_with_prefix(&self) -> String {
-        format!("{}/{}", self.0, self.prefix())
-    }
-
-    pub(crate) fn prefix(&self) -> u8 {
-        match self.0 {
-            IpAddr::V4(_) => 24,
-            IpAddr::V6(_) => 64,
-        }
+    pub(crate) fn to_string(&self) -> String {
+        self.0.to_string()
     }
 }
 
-impl From<IpAddr> for Addr {
-    fn from(addr: IpAddr) -> Self {
+impl From<IpNet> for Addr {
+    fn from(addr: IpNet) -> Self {
         Addr(addr)
-    }
-}
-
-impl Into<IpAddr> for Addr {
-    fn into(self) -> IpAddr {
-        self.0
     }
 }
 
 impl Into<IpNet> for Addr {
     fn into(self) -> IpNet {
-        IpNet::new(self.0, self.prefix()).unwrap()
+        self.0
     }
 }
 
@@ -64,11 +50,11 @@ pub(crate) struct Bridge {
 }
 
 impl Bridge {
-    pub(crate) fn new(index: usize, prefix: &str, ip: IpAddr) -> Self {
+    pub(crate) fn new(index: usize, prefix: &str, addr: IpNet) -> Self {
         Bridge {
             index: index,
             name: format!("{}-b-{}", prefix, index),
-            addr: ip.into(),
+            addr: addr.into(),
         }
     }
 }
@@ -80,7 +66,7 @@ pub(crate) struct NamespaceVeth {
 }
 
 impl NamespaceVeth {
-    pub(crate) fn new(addr: IpAddr, namespace: Namespace) -> Self {
+    pub(crate) fn new(addr: IpNet, namespace: Namespace) -> Self {
         NamespaceVeth {
             addr: addr.into(),
             namespace,

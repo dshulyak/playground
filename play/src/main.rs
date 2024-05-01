@@ -216,7 +216,9 @@ fn run(mut cmd: Command, opts: &Run) {
     }
     let mut e = Env::new(cfg);
     let err = run_error(opts, &mut e, tx);
-    let _ = e.clear();
+    if let Err(err)  = e.clear() {
+        tracing::error!("error during cleanup: {:?}", err);
+    };
     if let Err(err) = err {
         cmd.error(ErrorKind::Io, format!("{:?}", err)).exit();
     }
@@ -227,17 +229,32 @@ fn run_error(opts: &Run, e: &mut Env, tx: Receiver<()>) -> Result<()> {
     let first_netem = opts.netem.first().map(|n| n.clone());
     let first_count = opts.counts.first().copied().unwrap_or(1);
     let first_work_dir = opts.work_dirs.first().map(|w| w.clone());
-    for (i, cmd) in opts.commands.iter().enumerate() {
-        for _ in 0..opts.counts.get(i).copied().unwrap_or(first_count) {
-            let tbf = opts
-                .tbf
-                .get(i)
-                .map_or(first_tbf.clone(), |t| Some(t.clone()));
+
+    let total = opts
+        .commands
+        .iter()
+        .enumerate()
+        .map(|(i, _)| opts.counts.get(i).copied().unwrap_or(first_count))
+        .sum();
+    let qdisc = (0..total)
+        .map(|index| {
+            let tbf = opts.tbf.get(index).map(|t| t.clone()).or(first_tbf.clone());
             let netem = opts
                 .netem
-                .get(i)
-                .map_or(first_netem.clone(), |n| Some(n.clone()));
+                .get(index)
+                .map(|n| n.clone())
+                .or(first_netem.clone());
+            if tbf.is_some() || netem.is_some() {
+                Some((tbf, netem))
+            } else {
+                None
+            }
+        })
+        .scan((), |_, item| item);
+    e.generate(total, qdisc)?;
 
+    for (i, cmd) in opts.commands.iter().enumerate() {
+        for _ in 0..opts.counts.get(i).copied().unwrap_or(first_count) {
             let work_dir = opts
                 .work_dirs
                 .get(i)
@@ -247,8 +264,6 @@ fn run_error(opts: &Run, e: &mut Env, tx: Receiver<()>) -> Result<()> {
             let _ = e.add(
                 cmd.clone(),
                 work_dir.clone(),
-                tbf,
-                netem,
                 opts.env
                     .iter()
                     .map(|e| (e.0.clone(), e.1.clone()))

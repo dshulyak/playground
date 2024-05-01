@@ -1,3 +1,4 @@
+use core::generate_one;
 use std::collections::{BTreeMap, HashMap};
 use std::fs::OpenOptions;
 use std::io::{BufRead, BufReader};
@@ -12,15 +13,14 @@ use ipnet::{IpAddrRange, IpNet};
 use rand::distributions::Alphanumeric;
 use rand::{thread_rng, Rng};
 
+pub mod core;
 mod netlink;
 mod network;
 pub mod partition;
 pub mod shell;
 mod sysctl;
 
-use crate::network::{Bridge, Namespace, NamespaceVeth, Qdisc};
-
-// the primary limitation is the limit of ports enforced in the kernel (the limit is 1<<10)
+// the limit of ports enforced in the kernel is 1<<10
 // https://github.com/torvalds/linux/blob/80e62bc8487b049696e67ad133c503bf7f6806f7/net/bridge/br_private.h#L28
 // https://github.com/moby/moby/issues/44973#issuecomment-1543733757
 //
@@ -87,9 +87,9 @@ pub struct Env {
     cfg: Config,
     hosts: IpAddrRange,
     next: usize,
-    instances: Instances,
-    bridges: BTreeMap<usize, (Bridge, State)>,
-    connects: BTreeMap<(usize, usize), State>,
+    commands: BTreeMap<usize, CommandData>,
+    tasks: BTreeMap<usize, TaskData>,
+    network: core::Data,
     errors_sender: Sender<anyhow::Result<()>>,
     errors_receiver: Receiver<anyhow::Result<()>>,
     partition: Option<partition::Background>,
@@ -103,9 +103,9 @@ impl Env {
             cfg: cfg,
             hosts: hosts,
             next: 0,
-            bridges: BTreeMap::new(),
-            connects: BTreeMap::new(),
-            instances: Instances::new(),
+            commands: BTreeMap::new(),
+            tasks: BTreeMap::new(),
+            network: core::Data::new(),
             errors_sender: sender,
             errors_receiver: receiver,
             partition: None,
@@ -118,66 +118,56 @@ impl Env {
 
     pub fn enable_partition(&mut self, partition: partition::Partition) -> Result<()> {
         let veths = self
-            .instances
             .network
+            .veth
             .values()
-            .map(|network| network.veth.clone())
+            .map(|veth| veth.0.clone())
             .collect();
         let task = partition::Task::new(partition, veths);
         self.partition = Some(partition::Background::spawn(task)?);
         Ok(())
     }
 
-    fn next_addr(&mut self) -> Result<IpNet> {
-        let addr = self
-            .hosts
-            .next()
-            .ok_or(anyhow::anyhow!("run out of ip addresses"))?;
-        IpNet::new(addr, self.cfg.net.prefix_len()).context("failed to create ip network")
+    pub fn generate<'a>(
+        &mut self,
+        n: usize,
+        qdisc: impl Iterator<Item = (Option<String>, Option<String>)>,
+    ) -> Result<()> {
+        let cfg = core::Config {
+            prefix: self.cfg.prefix.clone(),
+            net: self.cfg.net.clone(),
+            per_bridge: self.cfg.instances_per_bridge,
+            vxlan_id: 0,
+            vxlan_port: 0,
+            vxlan_multicast_group: "0.0.0.0".parse().unwrap(),
+        };
+        let hosts = vec![core::Host {
+            name: "localhost".to_string(),
+            vxlan_device: "lo".to_string(),
+        }];
+        self.network = generate_one(&cfg, n, &hosts, &mut self.hosts, qdisc)?;
+        Ok(())
     }
 
     pub fn add(
         &mut self,
         cmd: String,
         work_dir: Option<PathBuf>,
-        tbf: Option<String>,
-        netem: Option<String>,
         os_env: HashMap<String, String>,
     ) -> anyhow::Result<usize> {
         let index = self.next;
         self.next += 1;
-        let bridge_index = index / self.cfg.instances_per_bridge;
-        if !self.bridges.contains_key(&bridge_index) {
-            let addr = self.next_addr()?;
-            let bridge = Bridge::new(bridge_index, &self.cfg.prefix, addr);
-            self.bridges.insert(bridge_index, (bridge, State::Pending));
-            for i in 0..bridge_index {
-                self.connects.insert((i, bridge_index), State::Pending);
-            }
-        }
 
-        let ns = Namespace::new(&self.cfg.prefix, index);
-        let addr = self.next_addr()?;
-        let veth = NamespaceVeth::new(addr, ns.clone());
         let current_dir = env::current_dir().context("failed to get current directory")?;
         let work_dir: &PathBuf = work_dir.as_ref().unwrap_or_else(|| &current_dir);
 
-        let network = NetworkData {
-            namespace: ns,
-            veth: veth,
-            qdisc: if tbf.is_some() || netem.is_some() {
-                Some(Qdisc { tbf, netem })
-            } else {
-                None
-            },
-        };
         let command = CommandData {
             command: cmd,
             work_dir: work_dir.clone(),
             os_env,
             redirect: self.cfg.redirect,
         };
-        self.instances.add(index, network, command);
+        self.commands.insert(index, command);
         Ok(index)
     }
 
@@ -187,65 +177,36 @@ impl Env {
         sysctl::ipv4_neigh_gc_threash3(2048000)?;
         sysctl::enable_ipv4_forwarding()?;
 
-        for (bridge, state) in self.bridges.values_mut() {
-            if let State::Pending = state {
-                netlink::bridge_apply(bridge)?;
-                *state = State::Deployed;
-            }
-        }
-        for ((from, to), state) in self.connects.iter_mut() {
-            if let State::Pending = state {
-                shell::bridge_connnect(
-                    &self.cfg.prefix,
-                    &self.bridges.get(&from).unwrap().0,
-                    &self.bridges.get(&to).unwrap().0,
-                )?;
-                *state = State::Deployed;
-            }
-        }
-
-        let data = &mut self.instances;
-        let network = &data.network;
-        let commands = &data.commands;
-        let state = &mut data.state;
-        let tasks = &mut data.tasks;
+        let cfg = core::Config {
+            prefix: self.cfg.prefix.clone(),
+            net: self.cfg.net.clone(),
+            per_bridge: self.cfg.instances_per_bridge,
+            vxlan_id: 0,
+            vxlan_port: 0,
+            vxlan_multicast_group: "0.0.0.0".parse().unwrap(),
+        };
 
         let since = std::time::Instant::now();
-        let zipped = state.iter_mut().zip(network.values());
+        core::deploy(&cfg, &mut self.network)?;
+        tracing::info!("configured network in {:?}", since.elapsed());
 
-        for ((index, state), network) in zipped {
-            if let State::Pending = state {
-                let bridge = self
-                    .bridges
-                    .get(&(index / self.cfg.instances_per_bridge))
-                    .unwrap();
-                netlink::namespace_apply(&network.namespace)?;
-                netlink::veth_apply(&network.veth, &bridge.0)?;
-                if let Some(qdisc) = &network.qdisc {
-                    shell::qdisc_apply(&network.veth, qdisc)?;
-                }
-                *state = State::Deployed;
-            }
-        }
-        tracing::info!("deployed in {:?}", since.elapsed());
+        let tasks = &mut self.tasks;
 
         let since = std::time::Instant::now();
-        let zipped = state
-            .iter_mut()
-            .zip(network.values())
-            .zip(commands.values());
-        for (((index, state), network), command) in zipped {
-            let task = run(*index, network, command, &self.errors_sender)?;
-            tasks.insert(*index, task);
-            *state = State::Running;
+        for (index, command) in self.commands.iter() {
+            if !tasks.contains_key(index) {
+                tasks.insert(
+                    *index,
+                    run(&self.cfg.prefix, *index, command, &self.errors_sender)?,
+                );
+            }
         }
         tracing::info!("commands started in {:?}", since.elapsed());
         Ok(())
     }
 
     pub fn clear(&mut self) -> anyhow::Result<()> {
-        let data = &mut self.instances;
-        let tasks = &mut data.tasks;
+        let tasks = &mut self.tasks;
 
         let since = std::time::Instant::now();
         for task in tasks.iter_mut() {
@@ -265,42 +226,17 @@ impl Env {
             partition.stop();
         }
         if self.cfg.revert {
-            self.revert_network()?;
-        }
-        Ok(())
-    }
-
-    fn revert_network(&mut self) -> Result<()> {
-        let data = &mut self.instances;
-        let since = std::time::Instant::now();
-        for network in data.network.values() {
-            if let Err(err) = netlink::veth_revert(&network.veth) {
-                tracing::debug!("failed to revert veth: {:?}", err);
-            }
-        }
-        tracing::info!("reverted veth config in {:?}", since.elapsed());
-        for network in data.network.values() {
-            if let Err(err) = netlink::namespace_revert(&network.namespace) {
-                tracing::debug!("failed to revert namespace: {:?}", err);
-            }
-        }
-        tracing::info!("reverted network config in {:?}", since.elapsed());
-
-        for ((from, to), state) in self.connects.iter_mut() {
-            if let Err(err) = shell::bridge_disconnect(
-                &self.cfg.prefix,
-                &self.bridges.get(from).unwrap().0,
-                &self.bridges.get(to).unwrap().0,
-            ) {
-                tracing::debug!("failed to disconnect bridges: {:?}", err);
-            }
-            *state = State::Pending;
-        }
-        for (bridge, state) in self.bridges.values_mut() {
-            if let Err(err) = shell::bridge_revert(bridge) {
-                tracing::debug!("failed to revert bridge {:?}", err);
-            }
-            *state = State::Pending;
+            let cfg = core::Config {
+                prefix: self.cfg.prefix.clone(),
+                net: self.cfg.net.clone(),
+                per_bridge: self.cfg.instances_per_bridge,
+                vxlan_id: 0,
+                vxlan_port: 0,
+                vxlan_multicast_group: "0.0.0.0".parse().unwrap(),
+            };
+            let since = std::time::Instant::now();
+            core::cleanup(&cfg, &mut self.network)?;
+            tracing::info!("network cleaned up in {:?}", since.elapsed());
         }
         Ok(())
     }
@@ -315,51 +251,11 @@ fn random_suffix(n: usize) -> String {
 }
 
 #[derive(Debug)]
-struct NetworkData {
-    namespace: Namespace,
-    veth: NamespaceVeth,
-    qdisc: Option<Qdisc>,
-}
-
-#[derive(Debug)]
 struct CommandData {
     command: String,
     work_dir: PathBuf,
     os_env: HashMap<String, String>,
     redirect: bool,
-}
-
-#[derive(Debug)]
-enum State {
-    Pending,
-    Deployed,
-    Running,
-}
-
-#[derive(Debug)]
-struct Instances {
-    network: BTreeMap<usize, NetworkData>,
-    commands: BTreeMap<usize, CommandData>,
-    tasks: BTreeMap<usize, TaskData>,
-    state: BTreeMap<usize, State>,
-}
-
-impl Instances {
-    fn new() -> Self {
-        Self {
-            network: BTreeMap::new(),
-            commands: BTreeMap::new(),
-            tasks: BTreeMap::new(),
-            state: BTreeMap::new(),
-        }
-    }
-
-    fn add(&mut self, index: usize, network: NetworkData, command: CommandData) -> usize {
-        self.network.insert(index, network);
-        self.commands.insert(index, command);
-        self.state.insert(index, State::Pending);
-        index
-    }
 }
 
 #[derive(Debug)]
@@ -369,13 +265,14 @@ struct TaskData {
 }
 
 fn run(
+    prefix: &str,
     index: usize,
-    network: &NetworkData,
     command: &CommandData,
     errors: &Sender<Result<()>>,
 ) -> anyhow::Result<TaskData> {
+    let name = network::Namespace::name(prefix, index);
     let cmd = command.command.replace("{index}", &index.to_string());
-    let cmd = format!("ip netns exec {} {}", network.namespace.name, cmd);
+    let cmd = format!("ip netns exec {} {}", name, cmd);
 
     tracing::debug!(redirect = command.redirect, "running command: {}", cmd);
 
@@ -390,16 +287,14 @@ fn run(
     if !command.redirect {
         shell.stdout(Stdio::piped()).stderr(Stdio::piped());
     } else {
-        let stdout = OpenOptions::new().append(true).create(true).open(
-            command
-                .work_dir
-                .join(format!("{}.stdout", network.namespace.name)),
-        )?;
-        let stderr = OpenOptions::new().append(true).create(true).open(
-            command
-                .work_dir
-                .join(format!("{}.stderr", network.namespace.name)),
-        )?;
+        let stdout = OpenOptions::new()
+            .append(true)
+            .create(true)
+            .open(command.work_dir.join(format!("{}.stdout", name)))?;
+        let stderr = OpenOptions::new()
+            .append(true)
+            .create(true)
+            .open(command.work_dir.join(format!("{}.stderr", name)))?;
         shell.stdout(stdout).stderr(stderr);
     }
 
@@ -419,7 +314,7 @@ fn run(
             .take()
             .ok_or_else(|| anyhow::anyhow!("failed to take stderr from child process"))?;
 
-        let id = network.namespace.name.clone();
+        let id = name.clone();
         let sender = errors.clone();
         let stdout_handler = thread::spawn(move || {
             let reader = BufReader::new(stdout);
@@ -435,7 +330,7 @@ fn run(
                 }
             }
         });
-        let id = network.namespace.name.clone();
+        let id = name.clone();
         let sender = errors.clone();
         let stderr_handler = thread::spawn(move || {
             let reader = BufReader::new(stderr);

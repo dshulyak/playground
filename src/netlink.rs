@@ -83,7 +83,9 @@ pub(crate) fn veth_apply(veth: &network::NamespaceVeth, bridge: &network::Bridge
 
 pub(crate) fn veth_revert(veth: &network::NamespaceVeth) -> Result<()> {
     let mut host = netlink::Socket::new()?;
-    host.del_link(LinkID::Name(veth.host()))?;
-    // ns.netlink.del_link(LinkID::Name(veth.guest()))?;
+    let index = host.get_link(LinkID::Name(veth.host()));
+    if let Ok(link) = index {
+        host.del_link(LinkID::ID(link.header.index))?;
+    }
     Ok(())
 }

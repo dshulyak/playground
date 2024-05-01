@@ -1,8 +1,9 @@
 use std::{fmt::Display, net::Ipv4Addr};
 
 use ipnet::IpNet;
+use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub(crate) struct Addr(IpNet);
 
 impl Addr {
@@ -11,7 +12,7 @@ impl Addr {
             std::net::IpAddr::V4(ip) => ip,
             _ => panic!("not ipv4"),
         }
-    }   
+    }
 }
 
 impl Display for Addr {
@@ -38,20 +39,24 @@ impl Into<IpNet> for Addr {
     }
 }
 
-#[derive(Debug, Clone, Hash, PartialEq, Eq)]
+#[derive(Debug, Clone, Hash, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct Namespace {
     pub(crate) name: String,
 }
 
 impl Namespace {
+    pub(crate) fn name(prefix: &str, index: usize) -> String {
+        format!("{}-{}", prefix, index)
+    }
+
     pub(crate) fn new(prefix: &str, index: usize) -> Self {
         Self {
-            name: format!("{}-{}", prefix, index),
+            name: Self::name(prefix, index),
         }
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub(crate) struct Bridge {
     pub(crate) index: usize,
     pub(crate) name: String,
@@ -68,7 +73,7 @@ impl Bridge {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub(crate) struct NamespaceVeth {
     pub(crate) addr: Addr,
     pub(crate) namespace: Namespace,
@@ -91,17 +96,23 @@ impl NamespaceVeth {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct Qdisc {
     pub(crate) tbf: Option<String>,
     pub(crate) netem: Option<String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct Vxlan {
     pub(crate) name: String,
     pub(crate) id: u32,
     pub(crate) port: u16,
     pub(crate) group: Ipv4Addr,
     pub(crate) device: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Link {
+    pub name: String,
+    pub addr: IpNet,
 }

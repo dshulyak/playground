@@ -18,6 +18,7 @@ netavark = "1.10.3"
 netlink-packet-route = "0.18.1"
 netns-rs = "0.1.0"
 sysctl = "0.5.5"
+serde = { version = "1.0.199", features = ["std", "derive"] }
 
 [dev-dependencies]
 tracing-subscriber = { version = "0.3.18", default-features = false, features = ["env-filter", "fmt", "ansi", "time", "local-time"] }

@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [workspace]
-members = ["play"]
+members = ["play", "playagent"]
 
 [dependencies]
 anyhow = "1.0.80"
@@ -19,6 +19,7 @@ netlink-packet-route = "0.18.1"
 netns-rs = "0.1.0"
 sysctl = "0.5.5"
 serde = { version = "1.0.199", features = ["std", "derive"] }
+itertools = "0.12.1"
 
 [dev-dependencies]
 tracing-subscriber = { version = "0.3.18", default-features = false, features = ["env-filter", "fmt", "ansi", "time", "local-time"] }

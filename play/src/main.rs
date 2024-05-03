@@ -1,11 +1,11 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{error::ErrorKind, Command, CommandFactory, Parser, Subcommand};
 use crossbeam::{
     channel::{unbounded, Receiver},
     select,
 };
 use playground::{partition::Partition, Config, Env};
-use std::{path::PathBuf, str::FromStr};
+use std::{collections::BTreeMap, env, path::PathBuf, str::FromStr};
 use tracing::metadata::LevelFilter;
 
 #[derive(Debug, Parser)]
@@ -76,7 +76,7 @@ cidr is expected to have as many addresses as th sum of all commands instances"
         help = "prefix for playground environment. every `X` in the value will be replaced by random integer.",
         default_value = "p-XXX"
     )]
-    prefix: String,
+    prefix: Option<String>,
     #[clap(
         long = "partition",
         help = "partition the network into several buckets.
@@ -113,28 +113,12 @@ it remains in the partitioned state for 10s and then gets restored.
     instances_per_bridge: Option<usize>,
 }
 
-impl Run {
-    fn unique_name(&self) -> String {
-        let mut name = String::new();
-        for c in self.prefix.chars() {
-            if c == 'X' {
-                let i = rand::random::<u8>() % 10;
-                name.push_str(&i.to_string());
-            } else {
-                name.push(c);
-            }
-        }
-        name
-    }
-}
-
 #[derive(Debug, Parser)]
 struct Cleanup {
     #[clap(
         long = "prefix",
         short = 'p',
-        help = "prefix for playground environment.",
-        default_value = "p-"
+        help = "prefix for playground environment."
     )]
     prefix: String,
 }
@@ -202,9 +186,11 @@ fn run(mut cmd: Command, opts: &Run) {
     }
     let mut cfg = Config::new()
         .with_network(opts.cidr)
-        .with_prefix(opts.unique_name())
         .with_revert(!opts.no_revert)
         .with_redirect(opts.redirect);
+    if let Some(prefix) = &opts.prefix {
+        cfg = cfg.with_prefix(prefix.clone());
+    }
     if let Some(instances_per_bridge) = opts.instances_per_bridge {
         cfg = match cfg.with_instances_per_bridge(instances_per_bridge) {
             Ok(cfg) => cfg,
@@ -216,7 +202,7 @@ fn run(mut cmd: Command, opts: &Run) {
     }
     let mut e = Env::new(cfg);
     let err = run_error(opts, &mut e, tx);
-    if let Err(err)  = e.clear() {
+    if let Err(err) = e.clear() {
         tracing::error!("error during cleanup: {:?}", err);
     };
     if let Err(err) = err {
@@ -229,6 +215,9 @@ fn run_error(opts: &Run, e: &mut Env, tx: Receiver<()>) -> Result<()> {
     let first_netem = opts.netem.first().map(|n| n.clone());
     let first_count = opts.counts.first().copied().unwrap_or(1);
     let first_work_dir = opts.work_dirs.first().map(|w| w.clone());
+    let current_dir = env::current_dir().context("failed to get current directory")?;
+
+    let default_work_dir = first_work_dir.unwrap_or_else(|| current_dir);
 
     let total = opts
         .commands
@@ -251,26 +240,27 @@ fn run_error(opts: &Run, e: &mut Env, tx: Receiver<()>) -> Result<()> {
             }
         })
         .scan((), |_, item| item);
+
+    let commands = opts.commands.iter().enumerate().flat_map(|(i, cmd)| {
+        let count = opts.counts.get(i).copied().unwrap_or(first_count);
+        std::iter::repeat(cmd.clone()).take(count)
+    });
+
+    let work_dirs = (0..total).map(|index| {
+        opts.work_dirs
+            .get(index)
+            .map_or_else(|| default_work_dir.clone(), |w| w.clone())
+    });
+
+    let os_env = opts
+        .env
+        .iter()
+        .map(|EnvValue(k, v)| (k.clone(), v.clone()))
+        .collect::<BTreeMap<_, _>>();
+    let os_envs = std::iter::repeat(os_env).take(total);
+
     e.generate(total, qdisc)?;
-
-    for (i, cmd) in opts.commands.iter().enumerate() {
-        for _ in 0..opts.counts.get(i).copied().unwrap_or(first_count) {
-            let work_dir = opts
-                .work_dirs
-                .get(i)
-                .or(first_work_dir.as_ref())
-                .map(|w| w.clone());
-
-            let _ = e.add(
-                cmd.clone(),
-                work_dir.clone(),
-                opts.env
-                    .iter()
-                    .map(|e| (e.0.clone(), e.1.clone()))
-                    .collect(),
-            )?;
-        }
-    }
+    e.generate_commands(total, commands, os_envs, work_dirs)?;
     let since = std::time::Instant::now();
     e.deploy()?;
     tracing::info!("playground deployed in {:?}", since.elapsed());
@@ -289,7 +279,6 @@ fn run_error(opts: &Run, e: &mut Env, tx: Receiver<()>) -> Result<()> {
                 Err(_) => {
                     tracing::info!("playground completed successfully");
                 }
-
             }
         }
     }

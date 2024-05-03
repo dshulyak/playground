@@ -1,4 +1,7 @@
-use std::{collections::BTreeMap, net::Ipv4Addr};
+use std::{
+    collections::BTreeMap,
+    net::{Ipv4Addr, SocketAddr},
+};
 
 use anyhow::{ensure, Context, Result};
 use ipnet::{IpAddrRange, IpNet};
@@ -6,25 +9,18 @@ use serde::{Deserialize, Serialize};
 
 use crate::{netlink, network, shell};
 
-#[derive(Debug, PartialEq, Serialize, Deserialize)]
-pub enum State {
-    Pending,
-    Deployed,
-    Deleting,
-    Failed,
-}
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, PartialEq, Deserialize)]
 pub struct Data {
     // vxlan may have as many entries as there are hosts
-    pub(crate) vxlan: BTreeMap<usize, (network::Vxlan, State)>,
+    pub(crate) vxlan: BTreeMap<usize, network::Vxlan>,
     // single bridge can be used by atmost 1000 ports (can be configured to be less)
     // number of bridges will be generated respecting per host and per bridge limits
-    pub(crate) bridges: BTreeMap<usize, (network::Bridge, State)>,
+    pub(crate) bridges: BTreeMap<usize, network::Bridge>,
     // veth pair in the namespace for every command
-    pub(crate) veth: BTreeMap<usize, (network::NamespaceVeth, State)>,
+    pub(crate) veth: BTreeMap<usize, network::NamespaceVeth>,
     // optional netem or tbf disciplines for every command
-    pub(crate) qdisc: BTreeMap<usize, (network::Qdisc, State)>,
+    pub(crate) qdisc: BTreeMap<usize, network::Qdisc>,
 }
 
 impl Data {
@@ -38,6 +34,7 @@ impl Data {
     }
 }
 
+
 pub struct Config {
     pub prefix: String,
     pub net: IpNet,
@@ -48,6 +45,7 @@ pub struct Config {
 }
 
 pub struct Host {
+    pub ip: SocketAddr,
     pub name: String,
     pub vxlan_device: String,
 }
@@ -70,21 +68,23 @@ pub fn generate(
     mut qdisc: impl Iterator<Item = (Option<String>, Option<String>)>,
 ) -> Result<Vec<Data>> {
     ensure!(hosts.len() > 0, "hosts must not be empty");
+    let multi_host = hosts.len() > 1;
     hosts
         .iter()
         .enumerate()
-        .map(|(index, _)| match index == 0 {
-            true => n / hosts.len() + n % hosts.len(),
-            false => n / hosts.len(),
+        .map(|(index, host)| match index == 0 {
+            true => (n / hosts.len() + n % hosts.len(), host),
+            false => (n / hosts.len(), host),
         })
-        .map(|n| generate_one(cfg, n, hosts, pool, &mut qdisc))
+        .map(|(n, host)| generate_one(cfg, n, multi_host, host, pool, &mut qdisc))
         .collect()
 }
 
 pub fn generate_one(
     cfg: &Config,
     n: usize,
-    hosts: &[Host],
+    multi_host: bool, 
+    host: &Host,
     pool: &mut IpAddrRange,
     mut qdisc: impl Iterator<Item = (Option<String>, Option<String>)>,
 ) -> Result<Data> {
@@ -95,32 +95,30 @@ pub fn generate_one(
     };
     for index in 0..bridges {
         let bridge = network::Bridge::new(index, &cfg.prefix, next_addr(cfg, pool)?);
-        data.bridges.insert(bridge.index, (bridge, State::Pending));
+        data.bridges.insert(bridge.index, bridge);
     }
-    if hosts.len() > 1 {
+    if multi_host {
         let vxlan = network::Vxlan {
             name: format!("vx-{}", cfg.prefix),
             id: cfg.vxlan_id,
             port: cfg.vxlan_port,
             group: cfg.vxlan_multicast_group,
-            device: hosts[0].vxlan_device.clone(),
+            device: host.vxlan_device.clone(),
         };
-        data.vxlan.insert(0, (vxlan, State::Pending));
+        data.vxlan.insert(0, vxlan);
     }
     for index in 0..n {
         let namespace = network::Namespace::new(&cfg.prefix, index);
-        let veth = network::NamespaceVeth::new(next_addr(cfg, pool)?, namespace);
-        data.veth.insert(index, (veth, State::Pending));
+        let veth =
+            network::NamespaceVeth::new(index / cfg.per_bridge, next_addr(cfg, pool)?, namespace);
+        data.veth.insert(index, veth);
         if let Some(qdisc) = qdisc.next() {
             data.qdisc.insert(
                 index,
-                (
-                    network::Qdisc {
-                        tbf: qdisc.0,
-                        netem: qdisc.1,
-                    },
-                    State::Pending,
-                ),
+                network::Qdisc {
+                    tbf: qdisc.0,
+                    netem: qdisc.1,
+                },
             );
         }
     }
@@ -128,49 +126,35 @@ pub fn generate_one(
 }
 
 // deploy all tasks that are in pending state.
-pub fn deploy(cfg: &Config, data: &mut Data) -> Result<()> {
-    for (bridge, state) in data
-        .bridges
-        .values_mut()
-        .filter(|(_, state)| *state == State::Pending)
-    {
+pub fn deploy(data: &Data) -> Result<()> {
+    for bridge in data.bridges.values() {
         netlink::bridge_apply(&bridge)?;
-        *state = State::Deployed;
     }
     let first = data.bridges.values();
     let mut second = data.bridges.values();
     _ = second.next();
     for (first, second) in first.zip(second) {
-        shell::bridge_connnect(&cfg.prefix, &first.0, &second.0)?;
+        shell::bridge_connnect(&first, &second)?;
     }
-    for (vxlan, state) in data
-        .vxlan
-        .values_mut()
-        .filter(|(_, state)| *state == State::Pending)
-    {
+    for vxlan in data.vxlan.values() {
         let bridge = data
             .bridges
             .values()
             .next()
             .ok_or_else(|| anyhow::anyhow!("no bridges"))?;
-        shell::vxlan_apply(&bridge.0, &vxlan)?;
-        *state = State::Deployed;
+        shell::vxlan_apply(&bridge, &vxlan)?;
     }
     let bridges = &data.bridges;
-    for (index, (veth, state)) in data.veth.iter_mut() {
-        if *state == State::Pending {
-            netlink::namespace_apply(&veth.namespace)?;
-            let bridge = bridges
-                .get(&(index / cfg.per_bridge))
-                .ok_or_else(|| anyhow::anyhow!("no bridge"))?;
-            netlink::veth_apply(&veth, &bridge.0)?;
-            *state = State::Deployed;
-        }
+    for (index, veth) in data.veth.iter() {
+        netlink::namespace_apply(&veth.namespace)?;
+        let bridge = bridges
+            .get(&veth.bridge)
+            .ok_or_else(|| anyhow::anyhow!("no bridge"))?;
+        netlink::veth_apply(&veth, &bridge)?;
 
-        match data.qdisc.get_mut(index) {
-            Some((qdisc, state)) if *state == State::Pending => {
+        match data.qdisc.get(index) {
+            Some(qdisc) => {
                 shell::qdisc_apply(&veth, &qdisc)?;
-                *state = State::Deployed;
             }
             _ => (),
         }
@@ -179,31 +163,25 @@ pub fn deploy(cfg: &Config, data: &mut Data) -> Result<()> {
 }
 
 // cleanup all tasks that are in deleting state.
-pub fn cleanup(_: &Config, data: &mut Data) -> Result<()> {
-    for (veth, _) in data.veth.values() {
+pub fn cleanup(data: &Data) -> Result<()> {
+    for veth in data.veth.values() {
         if let Err(err) = netlink::namespace_revert(&veth.namespace) {
             tracing::warn!("failed to revert namespace: {:?}", err);
         };
     }
-    for (bridge, state) in data.bridges.values_mut() {
+    for bridge in data.bridges.values() {
         if let Err(err) = shell::bridge_revert(&bridge) {
             tracing::warn!("failed to revert bridge: {:?}", err);
-        } else {
-            *state = State::Pending;
         }
     }
-    for (vxlan, state) in data.vxlan.values_mut() {
+    for vxlan in data.vxlan.values() {
         if let Err(err) = shell::vxlan_revert(&vxlan) {
             tracing::warn!("failed to revert vxlan: {:?}", err);
-        } else {
-            *state = State::Pending;
-        };
+        }
     }
-    for (veth, state) in data.veth.values_mut() {
+    for veth in data.veth.values() {
         if let Err(err) = netlink::veth_revert(&veth) {
             tracing::warn!("failed to revert veth: {:?}", err);
-        } else {
-            *state = State::Pending;
         }
     }
     Ok(())
@@ -229,6 +207,7 @@ mod tests {
     fn hosts(n: usize) -> Vec<Host> {
         (0..n)
             .map(|i| Host {
+                ip: "127.0.0.1:7777".parse().unwrap(),
                 name: format!("host{}", i),
                 vxlan_device: "eth0".to_string(),
             })
@@ -250,5 +229,20 @@ mod tests {
             assert_eq!(instance.veth.len(), N / hosts.len(), "{:?}", instance.veth);
             assert_eq!(instance.qdisc.len(), 0);
         }
+    }
+
+    #[test]
+    fn test_json() {
+        let cfg = test_config();
+        let hosts = hosts(3);
+        const N: usize = 5;
+        let data = generate(&cfg, N, &hosts, &mut cfg.net.hosts(), vec![].into_iter());
+        assert!(data.is_ok());
+        let data = data.unwrap();
+        let json = serde_json::to_string(&data).expect("failed to serialize");
+        let data1: Vec<Data> = serde_json::from_str(&json).expect("failed to deserialize");
+        assert_eq!(data, data1);
+        let json1 = serde_json::to_string(&data1).expect("failed to serialize");
+        assert_eq!(json, json1);
     }
 }

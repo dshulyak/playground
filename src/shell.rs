@@ -201,22 +201,20 @@ pub(crate) fn drop_packets_revert(
 }
 
 fn veth_connect_pair(
-    prefix: &str,
     first: &network::Bridge,
     second: &network::Bridge,
 ) -> (String, String) {
     (
-        format!("v-{}-c{}{}-0", prefix, first.index, second.index),
-        format!("v-{}-c{}{}-1", prefix, first.index, second.index),
+        format!("v-{}-{}-0", first.name, second.name),
+        format!("v-{}-{}-1", first.name, second.name),
     )
 }
 
 pub(crate) fn bridge_connnect(
-    prefix: &str,
     first: &network::Bridge,
     second: &network::Bridge,
 ) -> Result<()> {
-    let (pair0, pair1) = veth_connect_pair(prefix, first, second);
+    let (pair0, pair1) = veth_connect_pair( first, second);
     execute(&format!(
         "ip link add name {} type veth peer name {}",
         pair0, pair1,
@@ -229,11 +227,10 @@ pub(crate) fn bridge_connnect(
 }
 
 pub(crate) fn bridge_disconnect(
-    prefix: &str,
     first: &network::Bridge,
     second: &network::Bridge,
 ) -> Result<()> {
-    let (pair0, pair1) = veth_connect_pair(prefix, first, second);
+    let (pair0, pair1) = veth_connect_pair(first, second);
     execute(&format!("ip link del {}", pair0))?;
     execute(&format!("ip link del {}", pair1))?;
     Ok(())

@@ -75,13 +75,15 @@ impl Bridge {
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub(crate) struct NamespaceVeth {
+    pub(crate) bridge: usize,
     pub(crate) addr: Addr,
     pub(crate) namespace: Namespace,
 }
 
 impl NamespaceVeth {
-    pub(crate) fn new(addr: IpNet, namespace: Namespace) -> Self {
+    pub(crate) fn new(bridge: usize, addr: IpNet, namespace: Namespace) -> Self {
         NamespaceVeth {
+            bridge: bridge,
             addr: addr.into(),
             namespace,
         }
@@ -96,13 +98,13 @@ impl NamespaceVeth {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub(crate) struct Qdisc {
     pub(crate) tbf: Option<String>,
     pub(crate) netem: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub(crate) struct Vxlan {
     pub(crate) name: String,
     pub(crate) id: u32,
@@ -111,8 +113,3 @@ pub(crate) struct Vxlan {
     pub(crate) device: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Link {
-    pub name: String,
-    pub addr: IpNet,
-}

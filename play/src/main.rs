@@ -255,7 +255,7 @@ fn run(mut cmd: Command, opts: &Run) {
         opts.vxlan_multicast_group,
         opts.vxlan_device.clone(),
     );
-    let err = run_error(opts, &mut e, tx);
+    let err = rune(opts, &mut e, tx);
     if let Err(err) = e.clear() {
         tracing::error!("error during cleanup: {:?}", err);
     };
@@ -264,7 +264,7 @@ fn run(mut cmd: Command, opts: &Run) {
     }
 }
 
-fn run_error(opts: &Run, e: &mut Env, tx: Receiver<()>) -> Result<()> {
+fn rune(opts: &Run, e: &mut Env, tx: Receiver<()>) -> Result<()> {
     let first_tbf = opts.tbf.first().map(|t| t.clone());
     let first_netem = opts.netem.first().map(|n| n.clone());
     let first_count = opts.counts.first().copied().unwrap_or(1);
@@ -313,8 +313,10 @@ fn run_error(opts: &Run, e: &mut Env, tx: Receiver<()>) -> Result<()> {
         .collect::<BTreeMap<_, _>>();
     let os_envs = std::iter::repeat(os_env).take(total);
 
-    e.generate(total, qdisc)?;
-    e.generate_commands(commands, os_envs, work_dirs)?;
+    let since = std::time::Instant::now();
+    e.generate(total, qdisc, commands, os_envs, work_dirs)?;
+    tracing::info!("playground generated in {:?}", since.elapsed());
+
     let since = std::time::Instant::now();
     e.deploy()?;
     tracing::info!("playground deployed in {:?}", since.elapsed());

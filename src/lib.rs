@@ -102,42 +102,46 @@ impl Env {
         &mut self,
         total_commands: usize,
         qdisc: impl Iterator<Item = (Option<String>, Option<String>)>,
+        commands: impl Iterator<Item = String>,
+        env: impl Iterator<Item = BTreeMap<String, String>>,
+        workdir: impl Iterator<Item = PathBuf>,
     ) -> Result<()> {
-        let cfg = core::Config {
-            prefix: self.prefix.clone(),
-            net: self.net.clone(),
-            per_bridge: self.instances_per_bridge,
-            vxlan_id: self.vxlan_id,
-            vxlan_port: self.vxlan_port,
-            vxlan_multicast_group: self.vxlan_multicast_group,
-            vxlan_device: self.vxlan_device.clone(),
-        };
-        let network = core::generate(&cfg, self.total_hosts, total_commands, &mut self.address_pool, qdisc)?;
+        let network = core::generate(
+            &core::Config {
+                prefix: self.prefix.clone(),
+                net: self.net.clone(),
+                per_bridge: self.instances_per_bridge,
+                vxlan_id: self.vxlan_id,
+                vxlan_port: self.vxlan_port,
+                vxlan_multicast_group: self.vxlan_multicast_group,
+                vxlan_device: self.vxlan_device.clone(),
+            },
+            self.total_hosts,
+            total_commands,
+            &mut self.address_pool,
+            qdisc,
+        )?;
+        let commands = supervisor::generate(
+            &self.prefix,
+            self.redirect,
+            network.iter().map(|data| data.veth.len()),
+            commands,
+            env,
+            workdir,
+        )?;
+
         ensure!(
             network.len() == self.total_hosts,
             "should generate for all hosts, instead got {:?}",
             network.len()
         );
-        self.network = network;
-        Ok(())
-    }
+        ensure!(
+            commands.len() == self.total_hosts,
+            "should generate for all hosts {:?}", commands.len(),
+        );
 
-    pub fn generate_commands(
-        &mut self,
-        commands: impl Iterator<Item = String>,
-        env: impl Iterator<Item = BTreeMap<String, String>>,
-        workdir: impl Iterator<Item = PathBuf>,
-    ) -> Result<()> {
-        let commands = supervisor::generate(
-            &self.prefix,
-            self.redirect,
-            self.network.iter().map(|data| data.veth.len()),
-            commands,
-            env,
-            workdir,
-        )?;
-        ensure!(commands.len() == self.total_hosts, "should generate for all hosts"); 
-        self.commands = commands[self.host_id-1].clone();
+        self.network = network;
+        self.commands = commands[self.host_id - 1].clone();
         Ok(())
     }
 
@@ -148,7 +152,7 @@ impl Env {
         sysctl::enable_ipv4_forwarding()?;
 
         let since = std::time::Instant::now();
-        core::deploy(&mut self.network[self.host_id-1])?;
+        core::deploy(&mut self.network[self.host_id - 1])?;
         tracing::info!("configured network in {:?}", since.elapsed());
 
         let since = std::time::Instant::now();
@@ -167,7 +171,9 @@ impl Env {
         }
         if self.revert {
             let since = std::time::Instant::now();
-            core::cleanup(&mut self.network[self.host_id-1])?;
+            if let Some(data) = self.network.get(self.host_id - 1) {
+                core::cleanup(data)?;
+            }
             tracing::info!("network cleaned up in {:?}", since.elapsed());
         }
         Ok(())

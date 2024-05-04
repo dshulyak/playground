@@ -1837,6 +1837,7 @@ dependencies = [
  "ctrlc",
  "ipnet",
  "playground",
+ "rand",
  "tracing",
  "tracing-subscriber",
 ]
@@ -1853,7 +1854,6 @@ dependencies = [
  "netavark",
  "netlink-packet-route 0.18.1",
  "netns-rs",
- "rand",
  "serde",
  "serde_json",
  "sysctl",

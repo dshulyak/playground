@@ -9,7 +9,6 @@ use std::{
 
 use anyhow::{Context, Result};
 use crossbeam::channel::Sender;
-use itertools::Itertools;
 use serde::{Deserialize, Serialize};
 
 use crate::network;
@@ -33,15 +32,15 @@ pub struct Execution {
 pub fn generate(
     prefix: &str,
     redirect: bool,
-    per_host: usize,
-    commands: impl Iterator<Item = String>,
+    per_host: impl Iterator<Item = usize>,
+    mut commands: impl Iterator<Item = String>,
     mut env: impl Iterator<Item = BTreeMap<String, String>>,
     mut workdir: impl Iterator<Item = PathBuf>,
 ) -> Result<Vec<BTreeMap<usize, CommandConfig>>> {
     let mut hosts = vec![];
-    for chunk in commands.enumerate().chunks(per_host).into_iter() {
+    for chunk in per_host {
         let mut conf = BTreeMap::new();
-        for (index, command) in chunk {
+        for (index, command) in (0..chunk).zip(&mut commands){
             let work_dir = workdir
                 .next()
                 .ok_or_else(|| anyhow::anyhow!("workdir is not provided for command {}", index))?;

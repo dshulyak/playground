@@ -4,7 +4,9 @@ use crossbeam::{
     channel::{unbounded, Receiver},
     select,
 };
-use playground::{partition::Partition, Config, Env};
+use playground::{partition::Partition, Env};
+use rand::distributions::Alphanumeric;
+use rand::{thread_rng, Rng};
 use std::{collections::BTreeMap, env, path::PathBuf, str::FromStr};
 use tracing::metadata::LevelFilter;
 
@@ -76,7 +78,7 @@ cidr is expected to have as many addresses as th sum of all commands instances"
         help = "prefix for playground environment. every `X` in the value will be replaced by random integer.",
         default_value = "p-XXX"
     )]
-    prefix: Option<String>,
+    prefix: String,
     #[clap(
         long = "partition",
         help = "partition the network into several buckets.
@@ -108,9 +110,42 @@ it remains in the partitioned state for 10s and then gets restored.
     redirect: bool,
     #[clap(
         long = "instances-per-bridge",
-        help = "number of instances per bridge."
+        help = "number of instances per bridge.",
+        default_value = "1000"
     )]
-    instances_per_bridge: Option<usize>,
+    instances_per_bridge: usize,
+    #[clap(
+        long = "host",
+        short = 'h',
+        help = "host id to use for playground environment. the correct identifier is host_id/total_hosts.",
+        default_value = "1/1"
+    )]
+    host_id: HostIdentifier,
+
+    #[clap(
+        long = "vxlan-id",
+        help = "vxlan id to use for vxlan tunnelling",
+        default_value = "1000"
+    )]
+    vxlan_id: u32,
+    #[clap(
+        long = "vxlan-port",
+        help = "port to use for vxlan tunnelling",
+        default_value = "4789"
+    )]
+    vxlan_port: u16,
+    #[clap(
+        long = "vxlan-multicast-group",
+        help = "multicast group to use for vxlan tunnelling",
+        default_value = "239.1.1.1"
+    )]
+    vxlan_multicast_group: std::net::Ipv4Addr,
+    #[clap(
+        long = "vxlan-device",
+        help = "device to use for vxlan tunnelling",
+        default_value = ""
+    )]
+    vxlan_device: String,
 }
 
 #[derive(Debug, Parser)]
@@ -121,6 +156,28 @@ struct Cleanup {
         help = "prefix for playground environment."
     )]
     prefix: String,
+}
+
+#[derive(Debug, Clone)]
+struct HostIdentifier {
+    id: usize,
+    total: usize,
+}
+
+impl FromStr for HostIdentifier {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let mut splitted = s.splitn(2, '/');
+        let id = splitted.next().map_or(Err("no id found".to_string()), Ok)?;
+        let total = splitted
+            .next()
+            .map_or(Err("no total found".to_string()), Ok)?;
+        Ok(HostIdentifier {
+            id: id.parse().unwrap(),
+            total: total.parse().unwrap(),
+        })
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -184,23 +241,20 @@ fn run(mut cmd: Command, opts: &Run) {
         )
         .exit();
     }
-    let mut cfg = Config::new()
-        .with_network(opts.cidr)
-        .with_revert(!opts.no_revert)
-        .with_redirect(opts.redirect);
-    if let Some(prefix) = &opts.prefix {
-        cfg = cfg.with_prefix(prefix.clone());
-    }
-    if let Some(instances_per_bridge) = opts.instances_per_bridge {
-        cfg = match cfg.with_instances_per_bridge(instances_per_bridge) {
-            Ok(cfg) => cfg,
-            Err(err) => {
-                cmd.error(ErrorKind::ValueValidation, format!("{:?}", err))
-                    .exit();
-            }
-        };
-    }
-    let mut e = Env::new(cfg);
+
+    let mut e = Env::new(
+        opts.host_id.id,
+        opts.host_id.total,
+        replace_xxx(&opts.prefix),
+        opts.cidr.clone(),
+        opts.instances_per_bridge,
+        !opts.no_revert,
+        opts.redirect,
+        opts.vxlan_id,
+        opts.vxlan_port,
+        opts.vxlan_multicast_group,
+        opts.vxlan_device.clone(),
+    );
     let err = run_error(opts, &mut e, tx);
     if let Err(err) = e.clear() {
         tracing::error!("error during cleanup: {:?}", err);
@@ -260,7 +314,7 @@ fn run_error(opts: &Run, e: &mut Env, tx: Receiver<()>) -> Result<()> {
     let os_envs = std::iter::repeat(os_env).take(total);
 
     e.generate(total, qdisc)?;
-    e.generate_commands(total, commands, os_envs, work_dirs)?;
+    e.generate_commands(commands, os_envs, work_dirs)?;
     let since = std::time::Instant::now();
     e.deploy()?;
     tracing::info!("playground deployed in {:?}", since.elapsed());
@@ -311,4 +365,17 @@ fn cleanup(mut cmd: Command, opts: &Cleanup) {
         }
     };
     tracing::info!(bridges = ?bridges, namespaces = ?namespaces, veth = ?veth, "cleanup completed");
+}
+
+fn replace_xxx(prefix: &str) -> String {
+    let count = prefix.matches("X").count();
+    prefix.replace(&"X".repeat(count), &random_alphanumeric(count))
+}
+
+fn random_alphanumeric(n: usize) -> String {
+    thread_rng()
+        .sample_iter(&Alphanumeric)
+        .take(n)
+        .map(char::from)
+        .collect()
 }

@@ -13,4 +13,5 @@ playground = { path = "../" }
 crossbeam = { version = "0.8.4", features = ["crossbeam-channel"] }
 ipnet = "2.9.0"
 tracing = "0.1.40"
+rand = "0.8.5"
 tracing-subscriber = { version = "0.3.18", default-features = false, features = ["env-filter", "fmt", "ansi", "time", "local-time"] }

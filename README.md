@@ -16,6 +16,21 @@ play run -c "ping 10.0.0.3" -c "ping 10.0.0.2" --netem='delay 10ms'
 play cleanup
 ```
 
+### Multihost setup
+
+playground can setup environment on multiple hosts, connected with multicast vxlan. The example is below, note that both sides need to have consistent configuration. 
+
+The important difference is with `-h 1/2` and `-h 2/2`, this way each side will deploy it is own share of commands, with correct ips.
+
+```bash
+vagrant up
+vagrant ssh first 
+sudo /target/release/play run -c "ping -q 10.0.0.2" -n 100 -p pi --vxlan-device eth1 -h 1/2
+# in another console
+vagrant ssh second
+sudo /target/release/play run -c "ping -q 10.0.0.2" -n 100 -p pi --vxlan-device eth1 -h 2/2
+```
+
 ### Library
 
 

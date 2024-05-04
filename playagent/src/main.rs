@@ -13,7 +13,6 @@ use clap::{error::ErrorKind, CommandFactory, Parser};
 use crossbeam::{channel::Receiver, select};
 use parking_lot::Mutex;
 use playground::{core, supervisor};
-use serde::{Deserialize, Serialize};
 use tracing::level_filters::LevelFilter;
 
 #[derive(Debug, Parser)]
@@ -85,7 +84,7 @@ fn app(opts: &Cli) -> anyhow::Result<axum::Router> {
         .map_err(|err| anyhow::anyhow!("{:?}", err))?;
 
     let host = Arc::new(HostInfo {
-        hostname: name.clone(),
+        hostname: name,
         vxlan_device: opts.vxlan_device.clone(),
     });
     let data = Mutex::new(Arc::new(Data::new()));
@@ -118,26 +117,9 @@ struct AppState {
     worker: Mutex<Worker>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct HostInfo {
-    hostname: String,
-    vxlan_device: String,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-struct Data {
-    network: core::Data,
-    commands: BTreeMap<usize, supervisor::CommandConfig>,
-}
-
-impl Data {
-    fn new() -> Self {
-        Data {
-            network: core::Data::new(),
-            commands: BTreeMap::new(),
-        }
-    }
-}
+type Data = playagent::Data;
+type HostInfo = playagent::HostInfo;
+type WorkerStatus = playagent::WorkerStatus;
 
 #[derive(Debug)]
 struct Worker {
@@ -158,14 +140,6 @@ impl Worker {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-enum WorkerStatus {
-    Pending,
-    Running,
-    Failed,
-    Stopping,
-    Stopped,
-}
 
 async fn get_host_info(
     State(state): State<Arc<AppState>>,

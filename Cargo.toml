@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [workspace]
-members = ["play", "playagent"]
+members = ["play", "playagent", "playctl"]
 
 [dependencies]
 anyhow = "1.0.80"

@@ -100,12 +100,13 @@ impl Env {
 
     pub fn generate(
         &mut self,
-        total_commands: usize,
+        commands: impl Iterator<Item = String> + Clone,
         qdisc: impl Iterator<Item = (Option<String>, Option<String>)>,
-        commands: impl Iterator<Item = String>,
         env: impl Iterator<Item = BTreeMap<String, String>>,
         workdir: impl Iterator<Item = PathBuf>,
     ) -> Result<()> {
+        let total_commands = commands.clone().count();
+
         let network = core::generate(
             &core::Config {
                 prefix: self.prefix.clone(),
@@ -124,7 +125,8 @@ impl Env {
         let commands = supervisor::generate(
             &self.prefix,
             self.redirect,
-            network.iter().map(|data| data.veth.len()),
+            self.total_hosts,
+            total_commands,
             commands,
             env,
             workdir,

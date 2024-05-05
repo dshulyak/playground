@@ -1854,6 +1854,7 @@ dependencies = [
  "netavark",
  "netlink-packet-route 0.18.1",
  "netns-rs",
+ "rtnetlink",
  "serde",
  "serde_json",
  "sysctl",

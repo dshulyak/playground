@@ -9,6 +9,7 @@ use std::{
 
 use anyhow::{Context, Result};
 use crossbeam::channel::Sender;
+use itertools::Itertools;
 use serde::{Deserialize, Serialize};
 
 use crate::network;
@@ -32,15 +33,20 @@ pub struct Execution {
 pub fn generate(
     prefix: &str,
     redirect: bool,
-    per_host: impl Iterator<Item = usize>,
-    mut commands: impl Iterator<Item = String>,
+    total_hosts: usize,
+    total_commands: usize,
+    commands: impl Iterator<Item = String>,
     mut env: impl Iterator<Item = BTreeMap<String, String>>,
     mut workdir: impl Iterator<Item = PathBuf>,
 ) -> Result<Vec<BTreeMap<usize, CommandConfig>>> {
     let mut hosts = vec![];
-    for chunk in per_host {
+    for chunk in commands
+        .enumerate()
+        .chunks(total_commands / total_hosts)
+        .into_iter()
+    {
         let mut conf = BTreeMap::new();
-        for (index, command) in (0..chunk).zip(&mut commands){
+        for (index, command) in chunk {
             let work_dir = workdir
                 .next()
                 .ok_or_else(|| anyhow::anyhow!("workdir is not provided for command {}", index))?;
@@ -59,7 +65,11 @@ pub fn generate(
     Ok(hosts)
 }
 
-pub fn launch(cfg: &BTreeMap<usize, CommandConfig>, execution: &mut BTreeMap<usize, Execution>, errors: &Sender<Result<()>>) -> Result<()> {
+pub fn launch(
+    cfg: &BTreeMap<usize, CommandConfig>,
+    execution: &mut BTreeMap<usize, Execution>,
+    errors: &Sender<Result<()>>,
+) -> Result<()> {
     for (index, command) in cfg {
         let (child, stdout_handler, stderr_handler) = launch_one(
             *index,
@@ -128,11 +138,7 @@ fn launch_one(
     os_env: &Option<BTreeMap<String, String>>,
     redirect: bool,
     errors: &Sender<Result<()>>,
-) -> anyhow::Result<(
-    Child,
-    Option<JoinHandle<()>>,
-    Option<JoinHandle<()>>,
-)> {
+) -> anyhow::Result<(Child, Option<JoinHandle<()>>, Option<JoinHandle<()>>)> {
     let cmd = cmd.replace("{index}", &index.to_string());
     let cmd = format!("ip netns exec {} {}", name, cmd);
 

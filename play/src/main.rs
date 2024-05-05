@@ -314,7 +314,7 @@ fn rune(opts: &Run, e: &mut Env, tx: Receiver<()>) -> Result<()> {
     let os_envs = std::iter::repeat(os_env).take(total);
 
     let since = std::time::Instant::now();
-    e.generate(total, qdisc, commands, os_envs, work_dirs)?;
+    e.generate(commands, qdisc, os_envs, work_dirs)?;
     tracing::info!("playground generated in {:?}", since.elapsed());
 
     let since = std::time::Instant::now();

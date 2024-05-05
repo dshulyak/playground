@@ -19,6 +19,7 @@ netns-rs = "0.1.0"
 sysctl = "0.5.5"
 serde = { version = "1.0.199", features = ["std"] }
 itertools = "0.12.1"
+rtnetlink = "0.14.1"
 
 [dev-dependencies]
 tracing-subscriber = { version = "0.3.18", default-features = false, features = ["env-filter", "fmt", "ansi", "time", "local-time"] }

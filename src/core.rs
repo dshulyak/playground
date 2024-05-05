@@ -2,6 +2,7 @@ use std::{collections::BTreeMap, net::Ipv4Addr};
 
 use anyhow::{Context, Result};
 use ipnet::{IpAddrRange, IpNet};
+use itertools::Itertools;
 use serde::{Deserialize, Serialize};
 
 use crate::{netlink, network, shell};
@@ -57,32 +58,20 @@ pub fn generate(
     pool: &mut IpAddrRange,
     mut qdisc: impl Iterator<Item = (Option<String>, Option<String>)>,
 ) -> Result<Vec<Data>> {
-    (0..total_hosts)
-        .map(|index| match index == 0 {
-            true => total_commands / total_hosts + total_commands % total_hosts,
-            false => total_commands / total_hosts,
-        })
-        .map(|commands_per_host| {
-            generate_one(cfg, commands_per_host, pool, &mut qdisc)
-        })
+    (0..total_commands)
+        .chunks(total_commands / total_hosts)
+        .into_iter()
+        .map(|chunk| generate_one(cfg, chunk, pool, &mut qdisc))
         .collect()
 }
 
 pub fn generate_one(
     cfg: &Config,
-    commands_per_host: usize,
+    indexes: impl Iterator<Item = usize>,
     pool: &mut IpAddrRange,
     mut qdisc: impl Iterator<Item = (Option<String>, Option<String>)>,
 ) -> Result<Data> {
     let mut data = Data::new();
-    let bridges = match commands_per_host % cfg.per_bridge {
-        0 => commands_per_host / cfg.per_bridge,
-        _ => commands_per_host / cfg.per_bridge + 1,
-    };
-    for index in 0..bridges {
-        let bridge = network::Bridge::new(index, &cfg.prefix, next_addr(cfg, pool)?);
-        data.bridges.insert(bridge.index, bridge);
-    }
     if cfg.vxlan_device.len() > 0 {
         let vxlan = network::Vxlan {
             name: format!("vx-{}", cfg.prefix),
@@ -93,11 +82,22 @@ pub fn generate_one(
         };
         data.vxlan.insert(0, vxlan);
     }
-    for index in 0..commands_per_host {
-        let namespace = network::Namespace::new(&cfg.prefix, index);
-        let veth =
-            network::NamespaceVeth::new(index / cfg.per_bridge, next_addr(cfg, pool)?, namespace);
-        data.veth.insert(index, veth);
+    for index in indexes {
+        let bridge_index = index / cfg.per_bridge;
+        if !data.bridges.contains_key(&bridge_index) {
+            data.bridges.insert(
+                bridge_index,
+                network::Bridge::new(bridge_index, &cfg.prefix, next_addr(cfg, pool)?),
+            );
+        }
+        data.veth.insert(
+            index,
+            network::NamespaceVeth::new(
+                index / cfg.per_bridge,
+                next_addr(cfg, pool)?,
+                network::Namespace::new(&cfg.prefix, index),
+            ),
+        );
         if let Some(qdisc) = qdisc.next() {
             data.qdisc.insert(
                 index,

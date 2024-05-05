@@ -2,6 +2,7 @@ use std::{
     collections::BTreeMap,
     fs::OpenOptions,
     io::{BufRead, BufReader},
+    ops::Range,
     path::PathBuf,
     process::{Child, Command, Stdio},
     thread::{self, JoinHandle},
@@ -9,7 +10,6 @@ use std::{
 
 use anyhow::{Context, Result};
 use crossbeam::channel::Sender;
-use itertools::Itertools;
 use serde::{Deserialize, Serialize};
 
 use crate::network;
@@ -33,36 +33,33 @@ pub struct Execution {
 pub fn generate(
     prefix: &str,
     redirect: bool,
-    total_hosts: usize,
-    total_commands: usize,
-    commands: impl Iterator<Item = String>,
+    hosts: impl Iterator<Item = Range<usize>>,
+    mut commands: impl Iterator<Item = String>,
     mut env: impl Iterator<Item = BTreeMap<String, String>>,
     mut workdir: impl Iterator<Item = PathBuf>,
 ) -> Result<Vec<BTreeMap<usize, CommandConfig>>> {
-    let mut hosts = vec![];
-    for chunk in commands
-        .enumerate()
-        .chunks(total_commands / total_hosts)
-        .into_iter()
-    {
-        let mut conf = BTreeMap::new();
-        for (index, command) in chunk {
-            let work_dir = workdir
-                .next()
-                .ok_or_else(|| anyhow::anyhow!("workdir is not provided for command {}", index))?;
-            let os_env = env.next();
-            let command = CommandConfig {
-                name: network::Namespace::name(prefix, index),
-                command,
-                work_dir,
-                os_env,
-                redirect,
-            };
-            conf.insert(index, command);
-        }
-        hosts.push(conf);
-    }
-    Ok(hosts)
+    // split commands into equal chunks with all remaining commands in the last chunk
+    hosts
+        .map(|chunk| {
+            chunk
+                .zip(&mut commands)
+                .map(|(index, command)| {
+                    let work_dir = workdir.next().ok_or_else(|| {
+                        anyhow::anyhow!("workdir is not provided for command {}", index)
+                    })?;
+                    let os_env = env.next();
+                    let command = CommandConfig {
+                        name: network::Namespace::name(prefix, index),
+                        command,
+                        work_dir,
+                        os_env,
+                        redirect,
+                    };
+                    Ok((index, command))
+                })
+                .collect()
+        })
+        .collect()
 }
 
 pub fn launch(

@@ -1850,7 +1850,6 @@ dependencies = [
  "crossbeam",
  "humantime",
  "ipnet",
- "itertools",
  "netavark",
  "netlink-packet-route 0.18.1",
  "netns-rs",

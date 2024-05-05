@@ -1,8 +1,7 @@
-use std::{collections::BTreeMap, net::Ipv4Addr};
+use std::{collections::BTreeMap, net::Ipv4Addr, ops::Range};
 
 use anyhow::{Context, Result};
 use ipnet::{IpAddrRange, IpNet};
-use itertools::Itertools;
 use serde::{Deserialize, Serialize};
 
 use crate::{netlink, network, shell};
@@ -53,14 +52,11 @@ fn next_addr(cfg: &Config, pool: &mut IpAddrRange) -> Result<IpNet> {
 // between several hosts and bridges.
 pub fn generate(
     cfg: &Config,
-    total_hosts: usize,
-    total_commands: usize,
+    hosts: impl Iterator<Item = Range<usize>>,
     pool: &mut IpAddrRange,
     mut qdisc: impl Iterator<Item = (Option<String>, Option<String>)>,
 ) -> Result<Vec<Data>> {
-    (0..total_commands)
-        .chunks(total_commands / total_hosts)
-        .into_iter()
+    hosts
         .map(|chunk| generate_one(cfg, chunk, pool, &mut qdisc))
         .collect()
 }
@@ -194,12 +190,11 @@ mod tests {
     #[test]
     fn test_generate() {
         let cfg = test_config();
-        const TOTAL_HOSTS: usize = 5;
-        const TOTAL_COMMANDS: usize = 10000;
+        const TOTAL_HOSTS: usize = 3;
+        const TOTAL_COMMANDS: usize = 6000;
         let data = generate(
             &cfg,
-            TOTAL_HOSTS,
-            TOTAL_COMMANDS,
+            vec![(0..2000), (2000..4000), (4000..6000)].into_iter(),
             &mut cfg.net.hosts(),
             vec![].into_iter(),
         );

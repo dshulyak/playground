@@ -107,6 +107,15 @@ impl Env {
     ) -> Result<()> {
         let total_commands = commands.clone().count();
 
+        let hosts = (0..self.total_hosts).scan(0, |last, host| {
+            let current = *last;
+            *last += match host {
+                0 => total_commands / self.total_hosts + total_commands % self.total_hosts,
+                _ => total_commands / self.total_hosts,
+            };
+            Some(current..*last)
+        });
+
         let network = core::generate(
             &core::Config {
                 prefix: self.prefix.clone(),
@@ -117,16 +126,14 @@ impl Env {
                 vxlan_multicast_group: self.vxlan_multicast_group,
                 vxlan_device: self.vxlan_device.clone(),
             },
-            self.total_hosts,
-            total_commands,
+            hosts.clone(),
             &mut self.address_pool,
             qdisc,
         )?;
         let commands = supervisor::generate(
             &self.prefix,
             self.redirect,
-            self.total_hosts,
-            total_commands,
+            hosts.clone(),
             commands,
             env,
             workdir,
@@ -139,7 +146,8 @@ impl Env {
         );
         ensure!(
             commands.len() == self.total_hosts,
-            "should generate for all hosts {:?}", commands.len(),
+            "should generate for all hosts {:?}",
+            commands.len(),
         );
 
         self.network = network;

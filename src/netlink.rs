@@ -56,7 +56,7 @@ pub(crate) fn veth_apply(veth: &network::NamespaceVeth, bridge: &network::Bridge
     peer_opts.netns = Some(ns.file.as_fd());
     let mut peer = LinkMessage::default();
     netlink::parse_create_link_options(&mut peer, peer_opts);
-    let mut host_veth = netlink::CreateLinkOptions::new(veth.host(), InfoKind::Veth);
+    let mut host_veth: netlink::CreateLinkOptions = netlink::CreateLinkOptions::new(veth.host(), InfoKind::Veth);
     host_veth.info_data = Some(InfoData::Veth(InfoVeth::Peer(peer)));
     host_veth.primary_index = bridge_index;
     host.netlink.create_link(host_veth)?;
@@ -69,6 +69,13 @@ pub(crate) fn veth_apply(veth: &network::NamespaceVeth, bridge: &network::Bridge
     ns.netlink
         .add_addr(guest_index, &veth.addr.clone().into())?;
 
+    let lo_index = ns
+        .netlink
+        .get_link(LinkID::Name("lo".to_string()))?
+        .header
+        .index;
+
+    ns.netlink.set_up(LinkID::ID(lo_index))?;
     ns.netlink.set_up(LinkID::Name(veth.guest()))?;
     host.netlink.set_up(LinkID::Name(veth.host()))?;
 

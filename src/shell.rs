@@ -230,9 +230,10 @@ pub(crate) fn bridge_disconnect(
     first: &network::Bridge,
     second: &network::Bridge,
 ) -> Result<()> {
-    let (pair0, pair1) = veth_connect_pair(first, second);
+    let (pair0, _) = veth_connect_pair(first, second);
     execute(&format!("ip link del {}", pair0))?;
-    execute(&format!("ip link del {}", pair1))?;
+    // the second half of the pair is deleted by the first half
+    // execute(&format!("ip link del {}", pair1))?;
     Ok(())
 }
 

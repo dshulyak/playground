@@ -114,7 +114,7 @@ pub fn deploy(data: &Data) -> Result<()> {
     }
     let first = data.bridges.values();
     let mut second = data.bridges.values();
-    _ = second.next();
+    _ = second.next(); // skip first
     for (first, second) in first.zip(second) {
         shell::bridge_connnect(&first, &second)?;
     }
@@ -151,6 +151,13 @@ pub fn cleanup(data: &Data) -> Result<()> {
             tracing::warn!("failed to revert namespace: {:?}", err);
         };
     }
+    let first = data.bridges.values();
+    let mut second = data.bridges.values();
+    _ = second.next(); // skip first
+    for (first, second) in first.zip(second) {
+        shell::bridge_disconnect(&first, &second)?;
+    }
+
     for bridge in data.bridges.values() {
         if let Err(err) = shell::bridge_revert(&bridge) {
             tracing::warn!("failed to revert bridge: {:?}", err);

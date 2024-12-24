@@ -1,38 +1,58 @@
-Toolkit for testing and debugging distributed applications with basic chaos capabilities.
+tool to bootstrap cluster of services across multiple hosts for testing. 
+supports linux netem/tbf and basic network partitioning chaos utilities 
 ---
 
 ## How to use?
-### Command line
-```bash
-cargo build --manifest-path=./play/Cargo.toml
-export PATH=$PATH:./target/debug/
-```
 
 ```bash
-play run -c "ping 10.0.0.3" -c "ping 10.0.0.2" --netem='delay 10ms'
+cargo install --path=./play
 ```
 
+The example below will setup 2 namespace with veth pair interconnected using the same bridge.
+With added delay of 100ms for outgoing packets. 
+
+The tool supports both tbf and netem disciplines. And doesn't impose any restrictions on using them.
+
 ```bash
-play cleanup
+sudo play run -c "ping 10.0.0.3" -c "ping 10.0.0.2" --netem='delay 10ms'
 ```
+
+Unless `--no-revert` is used, tool will cleanup network configuration when play run is terminated.
+But in case it wasn't correctly terminated, it is possible to cleanup manually.
+
+```bash
+sudo play cleanup --prefix=<MUST BE THE SAME PREFIX AS USED IN PLAY RUN>
+```
+
+### Multiple processes
+
+```bash
+sudo play run -n 2 -c "echo first {index}" -n 3 -c "echo and then {index}"
+```
+
+Will spawn 2 process with first command and then 3 processes with second command.
+There is no ordering guarantee.
+
+### Local host reachability
+
+Local host is available will be available on first ip in the subnet, by default 10.0.0.1.
+It can be used to setup and report observability data on that host.
 
 ### Multihost setup
 
-playground can setup environment on multiple hosts, connected with multicast vxlan. The example is below, note that both sides need to have consistent configuration. 
+If workload doesn't fit on the single host, it is possible to setup multiple hosts interconnected with vxlan tunnel.
 
-The important difference is with `-h 1/2` and `-h 2/2`, this way each side will deploy it is own share of commands, with correct ips.
-
+On host 1:
 ```bash
-vagrant up
-vagrant ssh first 
-sudo /target/release/play run -c "ping -q 10.0.0.2" -n 100 -p pi --vxlan-device eth1 -h 1/2
-# in another console
-vagrant ssh second
-sudo /target/release/play run -c "ping -q 10.0.0.2" -n 100 -p pi --vxlan-device eth1 -h 2/2
+sudo play run -c "ping -q 10.0.0.2" -n 100 -p pi --vxlan-device eth1 -h 1/2
 ```
 
-### Library
+On host 2:
+```bash
+sudo play run -c "ping -q 10.0.0.2" -n 100 -p pi --vxlan-device eth1 -h 2/2 
+```
 
+The important difference is in `-h` flag. It is used to partition network subnet between hosts..
 
 ### Sysctl modifications
 
@@ -48,3 +68,11 @@ sudo sysctl -w net.bridge.bridge-nf-call-iptables=0
 ```
 
 More details in https://serverfault.com/questions/963759/docker-breaks-libvirt-bridge-network
+
+### Debugging
+
+#### no such sysctl: net.bridge.bridge-nf-call-iptables
+
+```bash
+modprobe br_netfilter
+```

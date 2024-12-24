@@ -67,7 +67,7 @@ impl Bridge {
     pub(crate) fn new(index: usize, prefix: &str, addr: IpNet) -> Self {
         Bridge {
             index: index,
-            name: format!("{}-b-{}", prefix, index),
+            name: format!("{}b{}", prefix, index),
             addr: addr.into(),
         }
     }

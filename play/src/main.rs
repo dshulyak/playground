@@ -76,7 +76,7 @@ cidr is expected to have as many addresses as th sum of all commands instances"
         long = "prefix",
         short = 'p',
         help = "prefix for playground environment. every `X` in the value will be replaced by random integer.",
-        default_value = "p-XXX"
+        default_value = "pX"
     )]
     prefix: String,
     #[clap(
